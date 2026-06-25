@@ -15,4 +15,6 @@ COPY . .
 RUN useradd -m -u 1001 appuser && chown -R appuser /app
 USER appuser
 
-EXPOSE $PORT
+EXPOSE 8000
+
+CMD ["gunicorn", "main:app", "--worker-class", "uvicorn.workers.UvicornWorker", "--workers", "2", "--bind", "0.0.0.0:8000"]
