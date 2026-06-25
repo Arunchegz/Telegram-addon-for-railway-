@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-from pyrogram import Client, raw, utils
+from pyrofork import Client, raw, utils
 from pyrogram.errors import AuthBytesInvalid, FileReferenceExpired, FloodWait
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
 from pyrogram.session import Auth, Session
