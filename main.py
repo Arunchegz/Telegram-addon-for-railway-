@@ -47,6 +47,7 @@ SYNC_INTERVAL      = int(os.getenv("SYNC_INTERVAL", "300"))
 STREAM_CONCURRENCY = int(os.getenv("STREAM_CONCURRENCY", "5"))
 WAIT_TIMEOUT_S     = float(os.getenv("WAIT_TIMEOUT_S", "2.0"))
 STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "4"))
+LOCAL_READ_CHUNK   = int(os.getenv("LOCAL_READ_CHUNK", str(1024 * 1024)))
 
 tg: Client = None
 redis_client: aioredis.Redis = None
@@ -281,6 +282,19 @@ async def _ensure_download(movie_id: str, file_size: int, message_id: int):
     await download_manager.evict_lru_if_needed(redis_client)
 
 
+async def _yield_local_file(dl_file, start: int, length: int, request: Request):
+    sent = 0
+    while sent < length:
+        if await request.is_disconnected():
+            break
+        size = min(LOCAL_READ_CHUNK, length - sent)
+        data = await dl_file.pread(start + sent, size)
+        if not data:
+            break
+        sent += len(data)
+        yield data
+
+
 # ─── HYBRID PROXY — the heart of v2 ──────────────────────────────────────────
 @app.api_route("/proxy/{movie_id}", methods=["GET", "HEAD"])
 async def proxy(movie_id: str, request: Request):
@@ -363,18 +377,24 @@ async def proxy(movie_id: str, request: Request):
 
     # ── Path A: fully local ───────────────────────────────────────────────────
     if dl_map and dl_file and dl_file.exists() and dl_map.has_range(start, end):
-        data = await dl_file.pread(start, total)
-        return Response(content=data, status_code=206,
-                        headers={**headers, "X-Source": "local"})
+        return StreamingResponse(
+            _yield_local_file(dl_file, start, total, request),
+            status_code=206,
+            headers={**headers, "X-Source": "local"},
+            media_type=ctype_val,
+        )
 
     # ── Path B: wait for downloader to land the range ─────────────────────────
     if task and not task.is_done() and dl_map and dl_file and dl_file.exists():
         deadline = time.time() + WAIT_TIMEOUT_S
         while time.time() < deadline:
             if dl_map.covered_prefix(start) >= total:
-                data = await dl_file.pread(start, total)
-                return Response(content=data, status_code=206,
-                                headers={**headers, "X-Source": "local-waited"})
+                return StreamingResponse(
+                    _yield_local_file(dl_file, start, total, request),
+                    status_code=206,
+                    headers={**headers, "X-Source": "local-waited"},
+                    media_type=ctype_val,
+                )
             try:
                 remaining = deadline - time.time()
                 if remaining <= 0: break
@@ -387,11 +407,11 @@ async def proxy(movie_id: str, request: Request):
     if dl_map and dl_file and dl_file.exists():
         covered = dl_map.covered_prefix(start)
         if 0 < covered < total:
-            local_data = await dl_file.pread(start, covered)
             rest_start = start + covered
 
             async def _mixed():
-                yield local_data
+                async for chunk in _yield_local_file(dl_file, start, covered, request):
+                    yield chunk
                 async with stream_sem:
                     try: msg = await _fetch_msg(movie["message_id"])
                     except: return
