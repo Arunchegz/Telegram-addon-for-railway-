@@ -3,13 +3,7 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "gunicorn main:app --worker-class uvicorn.workers.UvicornWorker --workers 1 --bind 0.0.0.0:$PORT --timeout 300 --keep-alive 5"
 healthcheckPath = "/"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
-
-# NOTE: workers=1 is intentional.
-# DownloadManager is in-process — multiple workers = multiple tasks per movie.
-# If you need horizontal scale, run multiple Railway services each targeting
-# a different channel partition, sharing Redis for movie index.
