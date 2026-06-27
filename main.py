@@ -121,6 +121,7 @@ async def _sync_channel() -> int:
             return 0
         try:
             count = 0
+            found_ids = set()
             async for msg in tg.get_chat_history(CHANNEL_USERNAME):
                 try:
                     media = msg.video or msg.document
@@ -135,8 +136,18 @@ async def _sync_channel() -> int:
                         "quality": st.quality(fn), "source": st.source(fn),
                         "synced_at": int(time.time()),
                     })
+                    found_ids.add(mid)
                     count += 1
                 except: continue
+            
+            # Clean up deleted movies
+            current_movies = await st.load_movies(redis_client)
+            for mid in list(current_movies.keys()):
+                if mid not in found_ids:
+                    print(f"Sync: removing deleted movie {mid} from index")
+                    await st.del_movie(redis_client, mid)
+                    await download_manager.evict(mid, redis_client)
+
             await redis_client.set(st.R_SYNC_TS, str(time.time()))
             print(f"Sync: {count} movies")
             return count
