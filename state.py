@@ -151,3 +151,34 @@ def parse_series(filename: str) -> Optional[dict]:
     if m2:
         return {"season": int(m2.group(1)), "episode": int(m2.group(2))}
     return None
+
+
+def parse_show_title(filename: str) -> str:
+    name = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)
+    name = re.sub(r"[._\-–—+]", " ", name)
+    
+    # Split by common season/episode patterns
+    for pattern in [r"\b[Ss]\d{1,2}[Ee]\d{1,3}\b", r"\b[Ss]eason\s*\d+\b", r"\b[Ee]pisode\s*\d+\b"]:
+        parts = re.split(pattern, name, flags=re.IGNORECASE)
+        if len(parts) > 1:
+            name = parts[0]
+            break
+            
+    # Split by year
+    parts = re.split(r"\b(?:19|20)\d{2}\b", name)
+    if len(parts) > 1:
+        name = parts[0]
+        
+    # Split by video quality/source keywords
+    name = re.split(
+        r"\b(?:1080p|2160p|720p|480p|bluray|webrip|web dl|"
+        r"bdrip|hdrip|remux|x264|x265|hevc|avc|h264|h265|aac|dts|atmos|10bit)\b",
+        name, maxsplit=1, flags=re.IGNORECASE,
+    )[0]
+    
+    return re.sub(r"\s+", " ", name).strip().title()
+
+
+def show_id(filename: str) -> str:
+    title = parse_show_title(filename)
+    return movie_id(title)

@@ -196,16 +196,42 @@ async def debug_downloads():
 async def catalog(type: str, id: str):
     movies = await st.load_movies(redis_client)
     def is_series(m): return bool(re.search(r"s\d{2}e\d{2}|season\s*\d|episode\s*\d", m.get("file_name","").lower()))
-    filtered = {mid: m for mid, m in movies.items() if (type == "series") == is_series(m)}
-    async def build(mid, m):
-        fn = m.get("file_name","Unknown")
-        poster = await st.get_poster(redis_client, fn)
-        title, year = st.parse_title_year(fn)
-        prefix = "tgm:" if type == "movie" else "tgs:"
-        return {"id": f"{prefix}{mid}", "type": type, "name": title or fn,
-                "poster": poster, "posterShape": "poster", "year": year}
-    metas = await asyncio.gather(*[build(mid, m) for mid, m in filtered.items()])
-    return JSONResponse({"metas": list(metas)}, headers={"Cache-Control": "no-store"})
+    
+    if type == "movie":
+        filtered = {mid: m for mid, m in movies.items() if not is_series(m)}
+        async def build(mid, m):
+            fn = m.get("file_name","Unknown")
+            poster = await st.get_poster(redis_client, fn)
+            title, year = st.parse_title_year(fn)
+            return {"id": f"tgm:{mid}", "type": "movie", "name": title or fn,
+                    "poster": poster, "posterShape": "poster", "year": year}
+        metas = await asyncio.gather(*[build(mid, m) for mid, m in filtered.items()])
+        return JSONResponse({"metas": list(metas)}, headers={"Cache-Control": "no-store"})
+    
+    else:  # type == "series"
+        series_groups = {}
+        for mid, m in movies.items():
+            if not is_series(m): continue
+            fn = m.get("file_name","Unknown")
+            show_title = st.parse_show_title(fn)
+            sid = st.show_id(fn)
+            if sid not in series_groups:
+                series_groups[sid] = {"title": show_title, "files": []}
+            series_groups[sid]["files"].append((mid, m))
+            
+        async def build_series(sid, group):
+            fn = group["files"][0][1].get("file_name","Unknown")
+            poster = await st.get_poster(redis_client, fn)
+            year = ""
+            for _, m in group["files"]:
+                _, y = st.parse_title_year(m.get("file_name",""))
+                if y:
+                    year = y
+                    break
+            return {"id": f"tgs:{sid}", "type": "series", "name": group["title"],
+                    "poster": poster, "posterShape": "poster", "year": year}
+        metas = await asyncio.gather(*[build_series(sid, group) for sid, group in series_groups.items()])
+        return JSONResponse({"metas": list(metas)}, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/meta/{type}/{id}.json")
@@ -213,15 +239,56 @@ async def meta(type: str, id: str):
     if id.startswith("tt"):
         title, year = await st.get_cinemeta(type, id)
         return JSONResponse({"meta": {"id": id, "type": type, "name": title, "year": year}})
+        
     prefix = "tgm:" if type == "movie" else "tgs:"
     clean  = id[len(prefix):] if id.startswith(prefix) else id
     movies = await st.load_movies(redis_client)
-    movie  = movies.get(clean)
-    if not movie: return JSONResponse({"meta": {}})
-    fn = movie.get("file_name","Unknown")
-    title, year = st.parse_title_year(fn)
-    return JSONResponse({"meta": {"id": id, "type": type, "name": title or fn, "year": year,
-        "poster": await st.get_poster(redis_client, fn), "description": fn, "posterShape": "poster"}})
+    
+    if type == "movie":
+        movie = movies.get(clean)
+        if not movie: return JSONResponse({"meta": {}})
+        fn = movie.get("file_name","Unknown")
+        title, year = st.parse_title_year(fn)
+        return JSONResponse({"meta": {"id": id, "type": type, "name": title or fn, "year": year,
+            "poster": await st.get_poster(redis_client, fn), "description": fn, "posterShape": "poster"}})
+    else:  # type == "series"
+        matching_files = [m for m in movies.values() if st.show_id(m.get("file_name", "")) == clean]
+        if not matching_files: return JSONResponse({"meta": {}})
+        matching_files.sort(key=lambda m: m.get("file_name", ""))
+        
+        first_file = matching_files[0]
+        fn = first_file.get("file_name", "Unknown")
+        show_title = st.parse_show_title(fn)
+        poster = await st.get_poster(redis_client, fn)
+        year = ""
+        for m in matching_files:
+            _, y = st.parse_title_year(m.get("file_name", ""))
+            if y:
+                year = y
+                break
+                
+        videos = []
+        seen_episodes = set()
+        for m in matching_files:
+            m_fn = m.get("file_name", "")
+            info = st.parse_series(m_fn)
+            s = info["season"] if info else 1
+            ep = info["episode"] if info else 1
+            key = (s, ep)
+            if key in seen_episodes: continue
+            seen_episodes.add(key)
+            
+            vid = f"tgs:{clean}:{s}:{ep}"
+            videos.append({
+                "id": vid, "season": s, "episode": ep, "title": f"Episode {ep}",
+                "released": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(m.get("synced_at", time.time()))),
+            })
+        videos.sort(key=lambda x: (x["season"], x["episode"]))
+        
+        return JSONResponse({"meta": {
+            "id": id, "type": "series", "name": show_title, "year": year,
+            "poster": poster, "description": f"Series: {show_title}", "posterShape": "poster", "videos": videos
+        }})
 
 
 @app.get("/stream/{type}/{id}.json")
@@ -253,6 +320,40 @@ async def stream(type: str, id: str):
         return JSONResponse({"streams": streams})
 
     clean = id[len(prefix):] if id.startswith(prefix) else id
+    
+    if type == "series" and ":" in clean:
+        parts = clean.split(":")
+        sid = parts[0]
+        try:
+            season = int(parts[1])
+            episode = int(parts[2])
+        except:
+            return JSONResponse({"streams": []})
+            
+        streams = []
+        for mid, m in movies.items():
+            fn = m.get("file_name", "")
+            if st.show_id(fn) != sid: continue
+            info = st.parse_series(fn)
+            s = info["season"] if info else 1
+            ep = info["episode"] if info else 1
+            if s == season and ep == episode:
+                try:
+                    fs = m.get("file_size")
+                    _schedule(_ensure_download(mid, fs, m["message_id"]))
+                except Exception as e:
+                    print(f"[stream] warn: {e}")
+                
+                q   = m.get("quality","Unknown")
+                sz  = m.get("file_size_text","Unknown")
+                src = m.get("source","")
+                streams.append({
+                    "name": "TGStream",
+                    "title": f"{fn}\n{q}{' | '+src if src else ''} | {sz}",
+                    "url": f"{BASE_URL}/proxy/{mid}"
+                })
+        return JSONResponse({"streams": streams})
+
     movie = movies.get(clean)
     if not movie: return JSONResponse({"streams": []})
     try:
@@ -262,7 +363,6 @@ async def stream(type: str, id: str):
             await st.del_movie(redis_client, clean)
             return JSONResponse({"streams": []})
         fs = movie.get("file_size") or media.file_size
-        # Eagerly start download — gets ahead before player even hits /proxy
         _schedule(_ensure_download(clean, fs, movie["message_id"]))
     except Exception as e:
         print(f"[stream] warn: {e}")
