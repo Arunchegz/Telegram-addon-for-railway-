@@ -176,7 +176,32 @@ async def manual_sync(): return {"synced": await _sync_channel()}
 
 
 @app.get("/debug/movies")
-async def debug_movies(): return await st.load_movies(redis_client)
+async def debug_movies():
+    movies = await st.load_movies(redis_client)
+    for mid, m in movies.items():
+        task = download_manager.get(mid)
+        dl_map = download_manager.get_map(mid)
+        if not dl_map:
+            dl_map = await download_manager._load_map(mid, redis_client)
+            
+        file_path = STORAGE_DIR / f"{mid}.bin"
+        exists = file_path.exists()
+        
+        cached_bytes = dl_map.total_bytes() if exists else 0
+        m["cached_bytes"] = cached_bytes
+        m["cached_text"] = st.fmt_size(cached_bytes)
+        
+        fs = m.get("file_size", 0)
+        m["pct"] = round(cached_bytes / fs * 100, 1) if fs and exists else 0
+        
+        is_done = False
+        if exists:
+            done_val = await redis_client.get(f"tgstream:dl:done:{mid}")
+            is_done = done_val == b"1" or cached_bytes >= fs
+            
+        m["is_done"] = is_done
+        m["is_active"] = bool(task and task._task and not task._task.done())
+    return movies
 
 
 @app.get("/debug/downloads")
@@ -553,6 +578,64 @@ async def proxy(movie_id: str, request: Request):
                              headers={**headers, "X-Source": "telegram-live"}, media_type=ctype_val)
 
 
+# ── Media Control API Endpoints ───────────────────────────────────────────────
+@app.post("/api/media/{movie_id}/download")
+async def start_download_media(movie_id: str):
+    movies = await st.load_movies(redis_client)
+    movie = movies.get(movie_id)
+    if not movie:
+        raise HTTPException(status_code=404, detail="Movie not found in index")
+    
+    file_size = movie.get("file_size")
+    if not file_size:
+        try:
+            msg = await _fetch_msg(movie["message_id"])
+            file_size = (msg.video or msg.document).file_size
+        except:
+            raise HTTPException(status_code=502, detail="Telegram unavailable")
+            
+    _schedule(_ensure_download(movie_id, file_size, movie["message_id"]))
+    return {"status": "ok"}
+
+
+@app.post("/api/media/{movie_id}/pause")
+async def pause_download_media(movie_id: str):
+    task = download_manager.get(movie_id)
+    if task:
+        task.cancel()
+        return {"status": "ok"}
+    return {"status": "ignored"}
+
+
+@app.post("/api/media/{movie_id}/evict")
+async def evict_cache_media(movie_id: str):
+    await download_manager.evict(movie_id, redis_client)
+    return {"status": "ok"}
+
+
+@app.delete("/api/media/{movie_id}")
+async def delete_media(movie_id: str, delete_tg: bool = False):
+    movies = await st.load_movies(redis_client)
+    movie = movies.get(movie_id)
+    if not movie:
+        raise HTTPException(status_code=404, detail="Movie not found in index")
+    
+    # 1. Evict cache from downloader
+    await download_manager.evict(movie_id, redis_client)
+    
+    # 2. Optionally delete from Telegram
+    if delete_tg:
+        try:
+            await tg.delete_messages(CHANNEL_USERNAME, [movie["message_id"]])
+        except Exception as e:
+            print(f"[delete_media] failed to delete from Telegram: {e}")
+            raise HTTPException(status_code=502, detail=f"Failed to delete from Telegram: {e}")
+            
+    # 3. Delete from index
+    await st.del_movie(redis_client, movie_id)
+    return {"status": "ok"}
+
+
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
@@ -565,165 +648,946 @@ def _dashboard_html(manifest_url: str, stremio_url: str, channel: str) -> str:
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TGStream v2</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TGStream - Media Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-:root{{--bg:#0d0f14;--s:#161a22;--s2:#1e2330;--b:#262d3d;--a:#5b8cf5;--a2:#3dffd0;
-      --t:#e2e8f0;--m:#637089;--g:#48bb78;--y:#f6ad55;--r:#f56565;--pu:#a78bfa;}}
-*{{box-sizing:border-box;margin:0;padding:0;}}
-body{{font-family:Inter,system-ui,sans-serif;background:var(--bg);color:var(--t);min-height:100vh;display:flex;flex-direction:column;}}
-header{{background:var(--s);border-bottom:1px solid var(--b);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;}}
-.logo{{font-size:17px;font-weight:700;color:var(--a);}}
-.dot{{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--g);margin-right:6px;animation:pulse 2s ease-in-out infinite;}}
-@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.35}}}}
-main{{max-width:1100px;margin:0 auto;width:100%;padding:24px 18px;flex:1;display:flex;flex-direction:column;gap:18px;}}
-.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;}}
-.card{{background:var(--s);border:1px solid var(--b);border-radius:10px;padding:16px 18px;}}
-.cl{{font-size:10px;text-transform:uppercase;letter-spacing:.7px;color:var(--m);margin-bottom:6px;}}
-.cv{{font-size:24px;font-weight:700;font-family:monospace;}}
-.cv.b{{color:var(--a)}} .cv.g{{color:var(--g)}} .cv.y{{color:var(--y)}} .cv.pu{{color:var(--pu)}}
-.panel{{background:var(--s);border:1px solid var(--b);border-radius:10px;overflow:hidden;}}
-.tabs{{display:flex;gap:2px;padding:0 18px;background:var(--s);border-bottom:1px solid var(--b);}}
-.tab{{padding:10px 16px;font-size:12px;font-weight:600;color:var(--m);cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;}}
-.tab.active{{color:var(--a);border-bottom-color:var(--a);}}
-.tab-panel{{display:none;}} .tab-panel.active{{display:block;}}
-.pb{{padding:16px 18px;}}
-table{{width:100%;border-collapse:collapse;font-size:12px;}}
-thead th{{text-align:left;padding:7px 10px;font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--m);border-bottom:1px solid var(--b);}}
-tbody tr{{border-bottom:1px solid var(--b);transition:background .1s;}}
-tbody tr:hover{{background:var(--s2);}} tbody tr:last-child{{border-bottom:none;}}
-td{{padding:9px 10px;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
-.badge{{display:inline-flex;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700;}}
-.b1080{{background:#1d3454;color:#60a5fa;}} .b2160{{background:#2d1f4e;color:#a78bfa;}}
-.b720{{background:#1a3a2e;color:#34d399;}} .bdef{{background:#2d2d2d;color:#6b7280;}}
-.pbar-wrap{{width:80px;background:var(--b);border-radius:3px;height:5px;overflow:hidden;display:inline-block;vertical-align:middle;}}
-.pbar{{height:100%;border-radius:3px;background:var(--a2);transition:width .5s;}}
-.btn{{padding:7px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .15s;display:inline-flex;align-items:center;gap:6px;text-decoration:none;}}
-.btn-p{{background:var(--a);color:#fff;}} .btn-p:hover{{background:#4a7ce8;}}
-.btn-g{{background:var(--s2);color:var(--t);border:1px solid var(--b);}} .btn-g:hover{{border-color:var(--a);color:var(--a);}}
-.btn:disabled{{opacity:.5;cursor:not-allowed;}}
-.url-box{{background:#0a0c10;border:1px solid var(--b);border-radius:6px;padding:10px 14px;font-family:monospace;font-size:12px;color:var(--a2);word-break:break-all;display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;}}
-.copy-btn{{background:var(--s2);border:1px solid var(--b);border-radius:4px;padding:3px 10px;font-size:11px;color:var(--m);cursor:pointer;transition:all .15s;white-space:nowrap;}}
-.copy-btn:hover{{color:var(--a2);border-color:var(--a2);}}
-.search{{width:100%;background:var(--s2);border:1px solid var(--b);border-radius:6px;padding:8px 12px;font-size:12px;color:var(--t);outline:none;font-family:inherit;margin-bottom:12px;}}
-.search:focus{{border-color:var(--a);}} .search::placeholder{{color:var(--m);}}
-#sync-res{{font-size:12px;color:var(--g);margin-top:8px;min-height:18px;}}
-footer{{padding:14px 24px;border-top:1px solid var(--b);font-size:11px;color:var(--m);text-align:center;}}
-.info-box{{background:var(--s2);border-radius:8px;padding:14px 16px;font-size:12px;color:var(--m);line-height:1.8;margin-top:4px;}}
+:root {{
+  --bg: #090a0f;
+  --bg-gradient: radial-gradient(circle at top, #141724 0%, #090a0f 100%);
+  --panel: rgba(20, 22, 33, 0.75);
+  --panel-border: rgba(255, 255, 255, 0.05);
+  --panel-hover: rgba(30, 33, 48, 0.85);
+  --text: #f1f3f9;
+  --text-muted: #858fa3;
+  --primary: #4f46e5;
+  --primary-hover: #6366f1;
+  --primary-glow: rgba(79, 70, 229, 0.4);
+  --accent: #06b6d4;
+  --accent-glow: rgba(6, 182, 212, 0.3);
+  --success: #10b981;
+  --success-bg: rgba(16, 185, 129, 0.1);
+  --success-text: #34d399;
+  --warning: #f59e0b;
+  --warning-bg: rgba(245, 158, 11, 0.1);
+  --warning-text: #fbbf24;
+  --danger: #ef4444;
+  --danger-bg: rgba(239, 68, 68, 0.1);
+  --danger-text: #f87171;
+  --card-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+}}
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{
+  font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
+  background: var(--bg);
+  background-image: var(--bg-gradient);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}}
+header {{
+  background: rgba(13, 15, 23, 0.8);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--panel-border);
+  padding: 16px 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}}
+.logo-container {{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}}
+.logo {{
+  font-size: 20px;
+  font-weight: 700;
+  background: linear-gradient(135deg, #a78bfa 0%, #4f46e5 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  letter-spacing: -0.5px;
+}}
+.tag-hybrid {{
+  background: rgba(99, 102, 241, 0.15);
+  border: 1px solid rgba(99, 102, 241, 0.3);
+  color: #a5b4fc;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+}}
+.dot {{
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  margin-right: 8px;
+  box-shadow: 0 0 10px var(--success);
+  animation: pulse 2s ease-in-out infinite;
+}}
+@keyframes pulse {{
+  0%, 100% {{ opacity: 1; transform: scale(1); }}
+  50% {{ opacity: 0.4; transform: scale(0.85); }}
+}}
+.channel-info {{
+  display: flex;
+  align-items: center;
+  font-size: 13px;
+  color: var(--text-muted);
+  background: rgba(255,255,255,0.03);
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.05);
+}}
+main {{
+  max-width: 1200px;
+  margin: 0 auto;
+  width: 100%;
+  padding: 32px 24px;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}}
+.cards {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+}}
+.card {{
+  background: var(--panel);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  padding: 20px;
+  box-shadow: var(--card-shadow);
+  transition: transform 0.2s, border-color 0.2s;
+}}
+.card:hover {{
+  transform: translateY(-2px);
+  border-color: rgba(255, 255, 255, 0.08);
+}}
+.cl {{
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}}
+.cv {{
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+}}
+.cv.b {{ color: var(--accent); text-shadow: 0 0 15px var(--accent-glow); }}
+.cv.g {{ color: var(--success); text-shadow: 0 0 15px var(--success-bg); }}
+.cv.y {{ color: var(--warning); text-shadow: 0 0 15px var(--warning-bg); }}
+.cv.pu {{ color: #a78bfa; text-shadow: 0 0 15px rgba(167, 139, 250, 0.2); }}
+
+.panel {{
+  background: var(--panel);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--panel-border);
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: var(--card-shadow);
+}}
+.tabs {{
+  display: flex;
+  gap: 6px;
+  padding: 8px 20px;
+  background: rgba(10, 11, 18, 0.4);
+  border-bottom: 1px solid var(--panel-border);
+}}
+.tab {{
+  padding: 12px 20px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 8px;
+  transition: all 0.2s ease;
+}}
+.tab:hover {{
+  color: var(--text);
+  background: rgba(255,255,255,0.03);
+}}
+.tab.active {{
+  color: #fff;
+  background: var(--primary);
+  box-shadow: 0 4px 12px var(--primary-glow);
+}}
+.tab-panel {{ display: none; }}
+.tab-panel.active {{ display: block; }}
+.pb {{ padding: 24px; }}
+
+.controls-row {{
+  display: flex;
+  gap: 12px;
+  margin-bottom: 20px;
+  align-items: center;
+  flex-wrap: wrap;
+}}
+.search-wrapper {{
+  position: relative;
+  flex: 1;
+  min-width: 250px;
+}}
+.search {{
+  width: 100%;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--text);
+  outline: none;
+  font-family: inherit;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}}
+.search:focus {{
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-glow);
+}}
+.search::placeholder {{ color: var(--text-muted); }}
+
+table {{
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 13px;
+}}
+th {{
+  text-align: left;
+  padding: 12px 16px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--panel-border);
+  background: rgba(0,0,0,0.1);
+}}
+td {{
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--panel-border);
+  vertical-align: middle;
+}}
+tbody tr {{ transition: background 0.15s; }}
+tbody tr:hover {{ background: rgba(255, 255, 255, 0.02); }}
+tbody tr:last-child td {{ border-bottom: none; }}
+
+.badge {{
+  display: inline-flex;
+  padding: 3px 8px;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}}
+.b1080 {{ background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); }}
+.b2160 {{ background: rgba(139, 92, 246, 0.15); color: #a78bfa; border: 1px solid rgba(139, 92, 246, 0.3); }}
+.b720 {{ background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }}
+.bdef {{ background: rgba(107, 114, 128, 0.15); color: #9ca3af; border: 1px solid rgba(107, 114, 128, 0.3); }}
+.b-cached {{ background: var(--success-bg); color: var(--success-text); border: 1px solid rgba(16, 185, 129, 0.2); }}
+
+.progress-cell {{
+  min-width: 140px;
+}}
+.pbar-container {{
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}}
+.pbar-wrap {{
+  width: 100%;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 4px;
+  height: 6px;
+  overflow: hidden;
+}}
+.pbar {{
+  height: 100%;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--accent) 0%, #38bdf8 100%);
+  box-shadow: 0 0 8px rgba(6, 182, 212, 0.5);
+  transition: width 0.4s ease;
+}}
+.pbar-active {{
+  background: linear-gradient(90deg, var(--primary) 0%, #818cf8 100%);
+  box-shadow: 0 0 8px var(--primary-glow);
+}}
+.progress-label {{
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-muted);
+}}
+
+.actions-cell {{
+  white-space: nowrap;
+  width: 1%;
+}}
+.actions-grp {{
+  display: flex;
+  gap: 8px;
+}}
+.btn {{
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-decoration: none;
+  font-family: inherit;
+}}
+.btn-icon-only {{
+  padding: 8px;
+  border-radius: 6px;
+  justify-content: center;
+}}
+.btn-p {{
+  background: var(--primary);
+  color: #fff;
+}}
+.btn-p:hover {{
+  background: var(--primary-hover);
+  box-shadow: 0 0 15px var(--primary-glow);
+}}
+.btn-a {{
+  background: var(--accent);
+  color: #0f172a;
+}}
+.btn-a:hover {{
+  background: #22d3ee;
+  box-shadow: 0 0 15px var(--accent-glow);
+}}
+.btn-g {{
+  background: rgba(255,255,255,0.03);
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+}}
+.btn-g:hover {{
+  border-color: rgba(255,255,255,0.15);
+  background: rgba(255,255,255,0.06);
+}}
+.btn-d {{
+  background: var(--danger-bg);
+  color: var(--danger-text);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}}
+.btn-d:hover {{
+  background: var(--danger);
+  color: #fff;
+  box-shadow: 0 0 15px rgba(239, 68, 68, 0.4);
+}}
+.btn:disabled {{
+  opacity: 0.4;
+  cursor: not-allowed;
+  box-shadow: none !important;
+}}
+
+.url-box {{
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--accent);
+  word-break: break-all;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}}
+.copy-btn {{
+  background: rgba(255,255,255,0.03);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}}
+.copy-btn:hover {{
+  color: #fff;
+  border-color: var(--accent);
+  background: rgba(6, 182, 212, 0.1);
+}}
+.info-box {{
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 12px;
+  padding: 18px;
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.8;
+  border: 1px solid var(--panel-border);
+}}
+
+/* Modal Styles */
+.modal {{
+  display: none;
+  position: fixed;
+  z-index: 1000;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  background-color: rgba(0,0,0,0.65);
+  backdrop-filter: blur(6px);
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}}
+.modal.active {{
+  display: flex;
+  animation: fadeIn 0.2s ease-out;
+}}
+.modal-content {{
+  background: #0f111a;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 16px;
+  padding: 26px;
+  width: 100%;
+  max-width: 480px;
+  box-shadow: 0 25px 50px rgba(0,0,0,0.6);
+  animation: scaleIn 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+}}
+.modal h3 {{
+  margin-bottom: 12px;
+  font-size: 18px;
+  color: var(--text);
+}}
+.modal p {{
+  font-size: 14px;
+  color: var(--text-muted);
+  margin-bottom: 20px;
+  line-height: 1.5;
+}}
+.modal-checkbox-label {{
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  margin-bottom: 20px;
+  user-select: none;
+  background: rgba(255,255,255,0.02);
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--panel-border);
+}}
+.modal-checkbox-label input {{
+  margin-top: 3px;
+}}
+.modal-warning {{
+  background: var(--danger-bg);
+  border: 1px solid rgba(239, 68, 68, 0.15);
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 12px;
+  color: var(--danger-text);
+  margin-bottom: 24px;
+  line-height: 1.4;
+}}
+.modal-actions {{
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}}
+
+/* Toast Notification Styles */
+.toast-container {{
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 1001;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}}
+.toast {{
+  background: #141724;
+  border: 1px solid rgba(255,255,255,0.06);
+  border-left: 4px solid var(--primary);
+  color: var(--text);
+  padding: 14px 20px;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 8px;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.4);
+  transform: translateX(120%);
+  transition: all 0.3s cubic-bezier(0.68, -0.55, 0.27, 1.55);
+  min-width: 250px;
+}}
+.toast.show {{
+  transform: translateX(0);
+}}
+.toast-success {{ border-left-color: var(--success); }}
+.toast-warning {{ border-left-color: var(--warning); }}
+.toast-danger {{ border-left-color: var(--danger); }}
+
+@keyframes fadeIn {{
+  from {{ opacity: 0; }}
+  to {{ opacity: 1; }}
+}}
+@keyframes scaleIn {{
+  from {{ transform: scale(0.95); opacity: 0; }}
+  to {{ transform: scale(1); opacity: 1; }}
+}}
+
+footer {{
+  padding: 24px;
+  border-top: 1px solid var(--panel-border);
+  font-size: 12px;
+  color: var(--text-muted);
+  text-align: center;
+  background: rgba(10, 11, 18, 0.2);
+}}
+footer a {{
+  color: var(--primary-hover);
+  text-decoration: none;
+}}
+footer a:hover {{
+  text-decoration: underline;
+}}
 </style>
 </head>
 <body>
 <header>
-  <div class="logo">TGStream <span style="font-size:11px;color:var(--a2);font-weight:400;">v2 · Hybrid</span></div>
-  <div style="font-size:11px;color:var(--m);"><span class="dot"></span>{channel}</div>
+  <div class="logo-container">
+    <div class="logo">TGStream</div>
+    <div class="tag-hybrid">v2 · Hybrid</div>
+  </div>
+  <div class="channel-info">
+    <span class="dot"></span>
+    <span>{channel}</span>
+  </div>
 </header>
 <main>
   <div class="cards">
-    <div class="card"><div class="cl">Movies</div><div class="cv b" id="stat-movies">—</div></div>
-    <div class="card"><div class="cl">Active Downloads</div><div class="cv pu" id="stat-dl">—</div></div>
-    <div class="card"><div class="cl">Status</div><div class="cv g">Online</div></div>
-    <div class="card"><div class="cl">Sync Age</div><div class="cv y" id="stat-sync">—</div></div>
+    <div class="card">
+      <div class="cl">Total Index</div>
+      <div class="cv b" id="stat-movies">—</div>
+    </div>
+    <div class="card">
+      <div class="cl">Active Downloads</div>
+      <div class="cv pu" id="stat-dl">—</div>
+    </div>
+    <div class="card">
+      <div class="cl">System Status</div>
+      <div class="cv g">Online</div>
+    </div>
+    <div class="card">
+      <div class="cl">Last Sync</div>
+      <div class="cv y" id="stat-sync">—</div>
+    </div>
   </div>
+  
   <div class="panel">
     <div class="tabs">
-      <div class="tab active" onclick="showTab('library')">Library</div>
-      <div class="tab" onclick="showTab('downloads')">Downloads</div>
-      <div class="tab" onclick="showTab('install')">Install</div>
+      <div class="tab active" onclick="showTab('library')">Library & Cache Manager</div>
+      <div class="tab" onclick="showTab('install')">Stremio Installation</div>
     </div>
-    <div id="tab-library" class="tab-panel active"><div class="pb">
-      <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;">
-        <input class="search" style="margin-bottom:0;flex:1;" placeholder="Filter..." oninput="filterMovies(this.value)">
-        <button class="btn btn-g" onclick="loadMovies()">Refresh</button>
-        <button class="btn btn-p" id="sync-btn" onclick="doSync()">Sync</button>
+    
+    <!-- Tab: Library -->
+    <div id="tab-library" class="tab-panel active">
+      <div class="pb">
+        <div class="controls-row">
+          <div class="search-wrapper">
+            <input class="search" placeholder="Search filenames..." oninput="filterMovies(this.value)">
+          </div>
+          <button class="btn btn-g" onclick="loadMovies()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg>
+            Refresh List
+          </button>
+          <button class="btn btn-p" id="sync-btn" onclick="doSync()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2.1l4 4-4 4M3 22l-4-4 4-4M21 6H9a4 4 0 0 0-4 4v12M3 18h12a4 4 0 0 0 4-4V2"></path></svg>
+            Sync Channel
+          </button>
+        </div>
+        
+        <div style="overflow-x:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>Media Details</th>
+                <th>File Size</th>
+                <th>Cache Status</th>
+                <th style="text-align:right;">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="movie-tbody">
+              <tr>
+                <td colspan="4" style="text-align:center;color:var(--text-muted);padding:40px;">
+                  <div style="display:flex;align-items:center;justify-content:center;gap:10px;">
+                    <span style="opacity: 0.6;">Loading library data...</span>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
-      <div id="sync-res"></div>
-      <div style="overflow-x:auto;"><table>
-        <thead><tr><th>Filename</th><th>Quality</th><th>Source</th><th>Size</th><th>Msg ID</th></tr></thead>
-        <tbody id="movie-tbody"><tr><td colspan="5" style="text-align:center;color:var(--m);padding:20px;">Loading...</td></tr></tbody>
-      </table></div>
-    </div></div>
-    <div id="tab-downloads" class="tab-panel"><div class="pb">
-      <div style="margin-bottom:12px;"><button class="btn btn-g" onclick="loadDl()">Refresh</button></div>
-      <div style="overflow-x:auto;"><table>
-        <thead><tr><th>Filename</th><th>Progress</th><th>Downloaded</th><th>Total</th><th>Status</th></tr></thead>
-        <tbody id="dl-tbody"><tr><td colspan="5" style="text-align:center;color:var(--m);padding:20px;">No active downloads</td></tr></tbody>
-      </table></div>
-    </div></div>
-    <div id="tab-install" class="tab-panel"><div class="pb" style="display:flex;flex-direction:column;gap:12px;">
-      <div>
-        <div style="font-size:10px;color:var(--m);margin-bottom:6px;text-transform:uppercase;letter-spacing:.6px;">Manifest URL</div>
-        <div class="url-box"><span>{manifest_url}</span><button class="copy-btn" onclick="cp('{manifest_url}',this)">Copy</button></div>
-        <div style="font-size:10px;color:var(--m);margin-bottom:6px;text-transform:uppercase;letter-spacing:.6px;">Stremio deep link</div>
-        <div class="url-box"><span>{stremio_url}</span><button class="copy-btn" onclick="cp('{stremio_url}',this)">Copy</button></div>
-        <a href="{stremio_url}" class="btn btn-p">Open in Stremio</a>
+    </div>
+    
+    <!-- Tab: Install -->
+    <div id="tab-install" class="tab-panel">
+      <div class="pb" style="display:flex;flex-direction:column;gap:16px;">
+        <div>
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.6px;">Stremio Addon Manifest URL</div>
+          <div class="url-box">
+            <span>{manifest_url}</span>
+            <button class="copy-btn" onclick="cp('{manifest_url}',this)">Copy URL</button>
+          </div>
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.6px;">Stremio Deep Link</div>
+          <div class="url-box">
+            <span>{stremio_url}</span>
+            <button class="copy-btn" onclick="cp('{stremio_url}',this)">Copy Link</button>
+          </div>
+          <a href="{stremio_url}" class="btn btn-p" style="margin-top: 8px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+            Open in Stremio Client
+          </a>
+        </div>
+        
+        <div class="info-box">
+          <b style="color:var(--accent);">Hybrid Streaming Architecture (4 paths):</b><br>
+          <ul style="margin-left: 20px; margin-top: 8px; display: flex; flex-direction: column; gap: 6px;">
+            <li><b style="color:var(--success);">Path A (local)</b> — Byte-range exists on disk. Served instantly from local SparseFile cache.</li>
+            <li><b style="color:var(--primary-hover);">Path B (local-waited)</b> — Byte-range is currently downloading. Thread waits up to 2s for download to land.</li>
+            <li><b style="color:var(--warning-text);">Path C (mixed)</b> — Serves already-cached prefix locally, and transparently shifts back to Telegram live download for remainder.</li>
+            <li><b style="color:var(--danger-text);">Path D (telegram-live)</b> — Direct streaming fallback via Telegram MTProto.</li>
+          </ul>
+        </div>
       </div>
-      <div class="info-box">
-        <b style="color:var(--a2);">Hybrid proxy — 4 paths:</b><br>
-        A. <b style="color:var(--g);">local</b> — range fully on disk, instant pread<br>
-        B. <b style="color:var(--a);">local-waited</b> — downloader caught up within 2s<br>
-        C. <b style="color:var(--y);">mixed</b> — local prefix + live Telegram tail<br>
-        D. <b style="color:var(--r);">telegram-live</b> — pure MTProto fallback<br>
-        <br>Check <code>X-Source</code> response header in devtools to see which path served each request.
-      </div>
-    </div></div>
+    </div>
   </div>
 </main>
-<footer>TGStream v2 · <a href="/api/docs" style="color:var(--a);text-decoration:none;">API Docs</a> · <a href="/manifest.json" style="color:var(--a);text-decoration:none;">Manifest</a></footer>
+
+<!-- Delete Modal -->
+<div id="delete-modal" class="modal">
+  <div class="modal-content">
+    <h3>Delete Media Item</h3>
+    <p>This will remove the media file from your Stremio library and permanently erase any local cached files from disk.</p>
+    
+    <label class="modal-checkbox-label">
+      <input type="checkbox" id="delete-tg-checkbox">
+      <span>Also delete the original post/file from the Telegram channel (<strong>{channel}</strong>)</span>
+    </label>
+    
+    <div class="modal-warning">
+      <strong>Caution:</strong> Deleting from the Telegram channel is permanent and cannot be undone. Make sure you have admin rights in this channel.
+    </div>
+    
+    <div class="modal-actions">
+      <button class="btn btn-g" onclick="closeDeleteModal()">Cancel</button>
+      <button class="btn btn-d" id="modal-confirm-btn" onclick="confirmDelete()">Delete Permanently</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast-container" class="toast-container"></div>
+
+<footer>
+  TGStream v2 · <a href="/api/docs" target="_blank">API Reference</a> · <a href="/manifest.json" target="_blank">Addon Manifest</a>
+</footer>
+
 <script>
-let allMovies={{}};
-function showTab(name){{
-  ['library','downloads','install'].forEach((n,i)=>{{
-    document.querySelectorAll('.tab')[i].classList.toggle('active',n===name);
-    document.getElementById('tab-'+n).classList.toggle('active',n===name);
+let allMovies = {{}};
+let movieToDeleteId = null;
+
+function showTab(name) {{
+  ['library', 'install'].forEach((n, i) => {{
+    document.querySelectorAll('.tab')[i].classList.toggle('active', n === name);
+    document.getElementById('tab-' + n).classList.toggle('active', n === name);
   }});
-  if(name==='downloads') loadDl();
 }}
-async function loadStats(){{
-  try{{const r=await fetch('/');const d=await r.json();
-    document.getElementById('stat-movies').textContent=d.movies??'—';
-    document.getElementById('stat-dl').textContent=d.active_downloads??0;
-    document.getElementById('stat-sync').textContent=d.sync_age_min!==null?d.sync_age_min+'m':'never';
-  }}catch(e){{}}
+
+async function loadStats() {{
+  try {{
+    const r = await fetch('/');
+    const d = await r.json();
+    document.getElementById('stat-movies').textContent = d.movies ?? '0';
+    document.getElementById('stat-dl').textContent = d.active_downloads ?? '0';
+    document.getElementById('stat-sync').textContent = d.sync_age_min !== null ? d.sync_age_min + 'm ago' : 'never';
+  }} catch(e) {{}}
 }}
-async function loadMovies(){{
-  try{{const r=await fetch('/debug/movies');allMovies=await r.json();renderMovies(allMovies);}}catch(e){{}}
+
+async function loadMovies() {{
+  try {{
+    const r = await fetch('/debug/movies');
+    allMovies = await r.json();
+    renderMovies(allMovies);
+  }} catch(e) {{
+    showToast('Failed to load media library', 'danger');
+  }}
 }}
-function badgeCls(q){{
+
+function badgeCls(q) {{
   if(q.includes('1080')) return 'b1080';
-  if(q.includes('2160')||q.includes('4K')) return 'b2160';
+  if(q.includes('2160') || q.includes('4K')) return 'b2160';
   if(q.includes('720')) return 'b720';
   return 'bdef';
 }}
-function renderMovies(movies){{
-  const e=Object.entries(movies);
-  if(!e.length){{document.getElementById('movie-tbody').innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--m);padding:20px;">No movies</td></tr>';return;}}
-  document.getElementById('movie-tbody').innerHTML=e.map(([id,m])=>{{
-    const q=m.quality||'Unknown';
-    return `<tr><td title="${{m.file_name||id}}">${{m.file_name||id}}</td><td><span class="badge ${{badgeCls(q)}}">${{q}}</span></td><td style="color:var(--m)">${{m.source||'—'}}</td><td style="font-family:monospace">${{m.file_size_text||'—'}}</td><td style="font-family:monospace;color:var(--m)">${{m.message_id}}</td></tr>`;
+
+function renderMovies(movies) {{
+  const entries = Object.entries(movies);
+  const tbody = document.getElementById('movie-tbody');
+  
+  if(!entries.length) {{
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:40px;">No movies indexed in the database. Run "Sync Channel" to scan your channel.</td></tr>';
+    return;
+  }}
+  
+  tbody.innerHTML = entries.map(([id, m]) => {{
+    const q = m.quality || 'Unknown';
+    const hasCache = m.cached_bytes > 0;
+    
+    // Cache UI representation
+    let cacheHtml = '';
+    if (m.is_done) {{
+      cacheHtml = `<span class="badge b-cached">Fully Cached</span>`;
+    }} else if (m.is_active || hasCache) {{
+      const pctClass = m.is_active ? 'pbar pbar-active' : 'pbar';
+      cacheHtml = `
+        <div class="progress-cell">
+          <div class="pbar-container">
+            <div class="pbar-wrap"><div class="${{pctClass}}" style="width:${{m.pct}}%"></div></div>
+            <div class="progress-label">
+              <span>${{m.is_active ? 'Downloading' : 'Paused'}}</span>
+              <span>${{m.pct}}% (${{m.cached_text}})</span>
+            </div>
+          </div>
+        </div>
+      `;
+    }} else {{
+      cacheHtml = `<span style="color:var(--text-muted)">Not Cached</span>`;
+    }}
+    
+    // Actions UI representation
+    let controlButtons = '';
+    if (m.is_active) {{
+      controlButtons = `
+        <button class="btn btn-g btn-icon-only" title="Pause Download" onclick="triggerPause('${{id}}')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></svg>
+        </button>
+      `;
+    }} else if (!m.is_done) {{
+      controlButtons = `
+        <button class="btn btn-a btn-icon-only" title="Start Download" onclick="triggerDownload('${{id}}')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+        </button>
+      `;
+    }}
+    
+    const clearCacheButton = hasCache ? `
+      <button class="btn btn-g btn-icon-only" title="Clear Disk Cache" onclick="triggerEvict('${{id}}')">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"></path><polyline points="21 3 21 8 16 8"></polyline><path d="M12 7v5l4 2"></path></svg>
+      </button>
+    ` : '';
+    
+    return `
+      <tr>
+        <td>
+          <div style="font-weight: 600; color: #fff; margin-bottom: 4px; max-width: 550px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${{m.file_name}}">
+            ${{m.file_name || id}}
+          </div>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <span class="badge ${{badgeCls(q)}}">${{q}}</span>
+            ${{m.source ? `<span class="badge bdef">${{m.source}}</span>` : ''}}
+            <span style="font-size:11px;color:var(--text-muted)">Msg ID: ${{m.message_id}}</span>
+          </div>
+        </td>
+        <td style="font-family: 'JetBrains Mono', monospace; font-weight: 500;">
+          ${{m.file_size_text || '—'}}
+        </td>
+        <td>
+          ${{cacheHtml}}
+        </td>
+        <td class="actions-cell">
+          <div class="actions-grp" style="justify-content: flex-end;">
+            ${{controlButtons}}
+            ${{clearCacheButton}}
+            <button class="btn btn-d btn-icon-only" title="Delete from Library" onclick="openDeleteModal('${{id}}')">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+            </button>
+          </div>
+        </td>
+      </tr>
+    `;
   }}).join('');
 }}
-function filterMovies(q){{q=q.toLowerCase();renderMovies(Object.fromEntries(Object.entries(allMovies).filter(([id,m])=>(m.file_name||id).toLowerCase().includes(q))));}}
-async function loadDl(){{
-  try{{const r=await fetch('/debug/downloads');const d=await r.json();
-    const e=Object.entries(d);
-    if(!e.length){{document.getElementById('dl-tbody').innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--m);padding:20px;">No downloads</td></tr>';return;}}
-    document.getElementById('dl-tbody').innerHTML=e.map(([id,s])=>{{
-      const pct=s.pct_done||0;
-      const status=s.done?'<span style="color:var(--g);">Done</span>':s.task_running?'<span style="color:var(--a2);">Active</span>':'<span style="color:var(--m);">Paused</span>';
-      return `<tr><td title="${{s.file_name||id}}">${{s.file_name||id}}</td><td><div class="pbar-wrap"><div class="pbar" style="width:${{pct}}%"></div></div> <span style="font-size:10px;color:var(--m);">${{pct}}%</span></td><td style="font-family:monospace">${{s.downloaded_mb}}MB</td><td style="font-family:monospace">${{s.total_mb}}MB</td><td>${{status}}</td></tr>`;
-    }}).join('');
-  }}catch(e){{}}
+
+function filterMovies(q) {{
+  q = q.toLowerCase();
+  const filtered = Object.fromEntries(
+    Object.entries(allMovies).filter(([id, m]) => 
+      (m.file_name || id).toLowerCase().includes(q)
+    )
+  );
+  renderMovies(filtered);
 }}
-async function doSync(){{
-  const btn=document.getElementById('sync-btn');const res=document.getElementById('sync-res');
-  btn.disabled=true;btn.textContent='Syncing...';res.textContent='';
-  try{{const r=await fetch('/sync');const d=await r.json();res.textContent='Synced '+d.synced+' files';await loadMovies();await loadStats();}}
-  catch(e){{res.style.color='var(--r)';res.textContent='Sync failed';}}
-  finally{{btn.disabled=false;btn.textContent='Sync';}}
+
+function openDeleteModal(id) {{
+  movieToDeleteId = id;
+  document.getElementById('delete-tg-checkbox').checked = false;
+  document.getElementById('delete-modal').classList.add('active');
 }}
-function cp(text,btn){{navigator.clipboard.writeText(text);const o=btn.textContent;btn.textContent='Copied!';btn.style.color='var(--g)';setTimeout(()=>{{btn.textContent=o;btn.style.color='';}},1500);}}
-loadStats();loadMovies();
-setInterval(()=>{{loadStats();if(document.getElementById('tab-downloads').classList.contains('active'))loadDl();}},5000);
+
+function closeDeleteModal() {{
+  document.getElementById('delete-modal').classList.remove('active');
+  movieToDeleteId = null;
+}}
+
+async function confirmDelete() {{
+  if(!movieToDeleteId) return;
+  const deleteTg = document.getElementById('delete-tg-checkbox').checked;
+  const btn = document.getElementById('modal-confirm-btn');
+  const oldText = btn.textContent;
+  
+  btn.disabled = true;
+  btn.textContent = 'Deleting...';
+  
+  try {{
+    const r = await fetch(`/api/media/${{movieToDeleteId}}?delete_tg=${{deleteTg}}`, {{
+      method: 'DELETE'
+    }});
+    if(r.ok) {{
+      showToast('Media item deleted successfully', 'success');
+      await loadMovies();
+      await loadStats();
+    }} else {{
+      const err = await r.json();
+      showToast('Deletion failed: ' + (err.detail || 'unknown error'), 'danger');
+    }}
+  }} catch(e) {{
+    showToast('Network error during deletion', 'danger');
+  }} finally {{
+    btn.disabled = false;
+    btn.textContent = oldText;
+    closeDeleteModal();
+  }}
+}}
+
+async function triggerDownload(id) {{
+  try {{
+    const r = await fetch(`/api/media/${{id}}/download`, {{ method: 'POST' }});
+    if(r.ok) {{
+      showToast('Download request scheduled', 'success');
+      await loadMovies();
+      await loadStats();
+    }} else {{
+      showToast('Failed to start download', 'danger');
+    }}
+  }} catch(e) {{
+    showToast('Network error', 'danger');
+  }}
+}}
+
+async function triggerPause(id) {{
+  try {{
+    const r = await fetch(`/api/media/${{id}}/pause`, {{ method: 'POST' }});
+    if(r.ok) {{
+      showToast('Download task paused', 'warning');
+      await loadMovies();
+      await loadStats();
+    }} else {{
+      showToast('Failed to pause download', 'danger');
+    }}
+  }} catch(e) {{
+    showToast('Network error', 'danger');
+  }}
+}}
+
+async function triggerEvict(id) {{
+  try {{
+    const r = await fetch(`/api/media/${{id}}/evict`, {{ method: 'POST' }});
+    if(r.ok) {{
+      showToast('Local cache wiped from storage', 'warning');
+      await loadMovies();
+      await loadStats();
+    }} else {{
+      showToast('Failed to clear cache', 'danger');
+    }}
+  }} catch(e) {{
+    showToast('Network error', 'danger');
+  }}
+}}
+
+async function doSync() {{
+  const btn = document.getElementById('sync-btn');
+  btn.disabled = true;
+  btn.textContent = 'Syncing...';
+  try {{
+    const r = await fetch('/sync');
+    const d = await r.json();
+    showToast(`Successfully synced ${{d.synced}} movies`, 'success');
+    await loadMovies();
+    await loadStats();
+  }} catch(e) {{
+    showToast('Sync process failed', 'danger');
+  }} finally {{
+    btn.disabled = false;
+    btn.textContent = 'Sync Channel';
+  }}
+}}
+
+function cp(text, btn) {{
+  navigator.clipboard.writeText(text);
+  const oldText = btn.textContent;
+  btn.textContent = 'Copied!';
+  btn.style.borderColor = 'var(--success)';
+  btn.style.color = 'var(--success-text)';
+  setTimeout(() => {{
+    btn.textContent = oldText;
+    btn.style.borderColor = '';
+    btn.style.color = '';
+  }}, 1500);
+}}
+
+function showToast(message, type = 'success') {{
+  const container = document.getElementById('toast-container');
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${{type}}`;
+  toast.textContent = message;
+  container.appendChild(toast);
+  
+  setTimeout(() => toast.classList.add('show'), 10);
+  
+  setTimeout(() => {{
+    toast.classList.remove('show');
+    setTimeout(() => toast.remove(), 300);
+  }}, 3500);
+}}
+
+// Initialize
+loadStats();
+loadMovies();
+
+// Auto-refresh stats and download progress every 4 seconds
+setInterval(() => {{
+  loadStats();
+  // Auto-reload movies list to update progress bars/statuses
+  loadMovies();
+}}, 4000);
 </script>
 </body>
 </html>"""
