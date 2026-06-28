@@ -32,9 +32,22 @@ from fastapi.staticfiles import StaticFiles
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 
+import pyrogram.utils
 import state as st
 from downloader import DownloadMap, download_manager, STORAGE_DIR
 from streamer import ByteStreamer, TG_CHUNK
+
+# Monkey-patch Pyrogram to support newer 64-bit channel/chat IDs (> 32-bit suffixes)
+def get_peer_type_patched(peer_id: int) -> str:
+    peer_id_str = str(peer_id)
+    if not peer_id_str.startswith("-"):
+        return "user"
+    elif peer_id_str.startswith("-100"):
+        return "channel"
+    else:
+        return "chat"
+
+pyrogram.utils.get_peer_type = get_peer_type_patched
 
 load_dotenv()
 
@@ -93,6 +106,16 @@ async def lifespan(app: FastAPI):
     await tg.start()
     byte_streamer = ByteStreamer(tg)
     print("Pyrogram started")
+    
+    # Warm up peer cache from dialogs (essential for private channels with 64-bit IDs)
+    try:
+        print("Warming up peer cache from dialogs...")
+        async for _ in tg.get_dialogs(limit=100):
+            pass
+        print("Peer cache warmed up")
+    except Exception as e:
+        print(f"[lifespan] warning: failed to warm up peer cache: {e}")
+        
     _schedule(_sync_loop())
     yield
     await download_manager.shutdown()
