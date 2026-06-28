@@ -250,15 +250,15 @@ class DownloadTask:
         """Main download loop. Sequential from play-head, skip already-downloaded."""
         print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB")
 
-        # Determine start offset: find first gap from hint
-        offset = self._find_next_gap(self._hint)
-
-        while offset < self.file_size:
-            # Skip already-downloaded chunks
-            if self.dl_map.has_range(offset, min(offset + DL_CHUNK - 1, self.file_size - 1)):
-                offset += DL_CHUNK
-                offset = self._find_next_gap(offset)
-                continue
+        while True:
+            # Find next gap starting from current play-head hint
+            offset = self._find_next_gap(self._hint)
+            if offset >= self.file_size:
+                # No gaps after hint, check from the beginning of the file
+                offset = self._find_next_gap(0)
+                if offset >= self.file_size:
+                    # No gaps in the entire file!
+                    break
 
             # Align to chunk boundary
             chunk_start = (offset // DL_CHUNK) * DL_CHUNK
@@ -284,6 +284,8 @@ class DownloadTask:
                     await self._persist_map()
                     self._progress_event.set()
                     self._progress_event = asyncio.Event()
+                else:
+                    raise Exception("No data received from Telegram")
 
             except asyncio.CancelledError:
                 print(f"[dl:{self.movie_id}] cancelled at {offset/1024/1024:.1f}MB")
@@ -296,12 +298,6 @@ class DownloadTask:
 
             # Yield to event loop — downloader is lower priority than proxy
             await asyncio.sleep(0)
-
-            # Move forward; re-prioritise from play-head if it jumped ahead
-            offset = chunk_start + DL_CHUNK
-            if self._hint > offset + DL_LOOKAHEAD:
-                # Player jumped ahead — re-prioritise
-                offset = self._find_next_gap(self._hint)
 
         # Done
         self._done = True
