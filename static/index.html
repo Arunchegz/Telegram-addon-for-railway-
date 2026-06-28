@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TGStream - Media Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+<header>
+  <div class="logo-container">
+    <div class="logo">TGStream</div>
+    <div class="tag-hybrid">v2 · Hybrid</div>
+  </div>
+  <div class="channel-info">
+    <span class="dot"></span>
+    <span id="channel-name-header">Loading...</span>
+  </div>
+</header>
+<main>
+  <div class="cards">
+    <div class="card">
+      <div class="cl">Total Index</div>
+      <div class="cv b" id="stat-movies">—</div>
+    </div>
+    <div class="card">
+      <div class="cl">Active Downloads</div>
+      <div class="cv pu" id="stat-dl">—</div>
+    </div>
+    <div class="card">
+      <div class="cl">System Status</div>
+      <div class="cv g">Online</div>
+    </div>
+    <div class="card">
+      <div class="cl">Last Sync</div>
+      <div class="cv y" id="stat-sync">—</div>
+    </div>
+  </div>
+  
+  <div class="panel">
+    <div class="tabs">
+      <div class="tab active" onclick="showTab('library')">Library & Cache Manager</div>
+      <div class="tab" onclick="showTab('install')">Stremio Installation</div>
+    </div>
+    
+    <!-- Tab: Library -->
+    <div id="tab-library" class="tab-panel active">
+      <div class="pb">
+        <div class="controls-row">
+          <div class="search-wrapper">
+            <input class="search" placeholder="Search filenames..." oninput="filterMovies(this.value)">
+          </div>
+          <button class="btn btn-g" onclick="loadMovies()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg>
+            Refresh List
+          </button>
+          <button class="btn btn-p" id="sync-btn" onclick="doSync()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2.1l4 4-4 4M3 22l-4-4 4-4M21 6H9a4 4 0 0 0-4 4v12M3 18h12a4 4 0 0 0 4-4V2"></path></svg>
+            Sync Channel
+          </button>
+        </div>
+        
+        <div style="overflow-x:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>Media Details</th>
+                <th>File Size</th>
+                <th>Cache Status</th>
+                <th style="text-align:right;">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="movie-tbody">
+              <tr>
+                <td colspan="4" style="text-align:center;color:var(--text-muted);padding:40px;">
+                  <div style="display:flex;align-items:center;justify-content:center;gap:10px;">
+                    <span style="opacity: 0.6;">Loading library data...</span>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Tab: Install -->
+    <div id="tab-install" class="tab-panel">
+      <div class="pb" style="display:flex;flex-direction:column;gap:16px;">
+        <div>
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.6px;">Stremio Addon Manifest URL</div>
+          <div class="url-box">
+            <span id="manifest-url-val">Loading...</span>
+            <button class="copy-btn" onclick="cp('manifest',this)">Copy URL</button>
+          </div>
+          <div style="font-size:11px;color:var(--text-muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.6px;">Stremio Deep Link</div>
+          <div class="url-box">
+            <span id="stremio-url-val">Loading...</span>
+            <button class="copy-btn" onclick="cp('stremio',this)">Copy Link</button>
+          </div>
+          <a id="stremio-install-btn" href="#" class="btn btn-p" style="margin-top: 8px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+            Open in Stremio Client
+          </a>
+        </div>
+        
+        <div class="info-box">
+          <b style="color:var(--accent);">Hybrid Streaming Architecture (4 paths):</b><br>
+          <ul style="margin-left: 20px; margin-top: 8px; display: flex; flex-direction: column; gap: 6px;">
+            <li><b style="color:var(--success);">Path A (local)</b> — Byte-range exists on disk. Served instantly from local SparseFile cache.</li>
+            <li><b style="color:var(--primary-hover);">Path B (local-waited)</b> — Byte-range is currently downloading. Thread waits up to 2s for download to land.</li>
+            <li><b style="color:var(--warning-text);">Path C (mixed)</b> — Serves already-cached prefix locally, and transparently shifts back to Telegram live download for remainder.</li>
+            <li><b style="color:var(--danger-text);">Path D (telegram-live)</b> — Direct streaming fallback via Telegram MTProto.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- Delete Modal -->
+<div id="delete-modal" class="modal">
+  <div class="modal-content">
+    <h3>Delete Media Item</h3>
+    <p>This will remove the media file from your Stremio library and permanently erase any local cached files from disk.</p>
+    
+    <label class="modal-checkbox-label">
+      <input type="checkbox" id="delete-tg-checkbox">
+      <span id="delete-tg-warning-channel">Also delete the original post/file from the Telegram channel (<strong>Loading...</strong>)</span>
+    </label>
+    
+    <div class="modal-warning">
+      <strong>Caution:</strong> Deleting from the Telegram channel is permanent and cannot be undone. Make sure you have admin rights in this channel.
+    </div>
+    
+    <div class="modal-actions">
+      <button class="btn btn-g" onclick="closeDeleteModal()">Cancel</button>
+      <button class="btn btn-d" id="modal-confirm-btn" onclick="confirmDelete()">Delete Permanently</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast-container" class="toast-container"></div>
+
+<footer>
+  TGStream v2 · <a href="/api/docs" target="_blank">API Reference</a> · <a href="/manifest.json" target="_blank">Addon Manifest</a>
+</footer>
+
+<script>
+let allMovies = {};
+let movieToDeleteId = null;
+let appConfig = {};
+
+function showTab(name) {
+  ['library', 'install'].forEach((n, i) => {
+    document.querySelectorAll('.tab')[i].classList.toggle('active', n === name);
+    document.getElementById('tab-' + n).classList.toggle('active', n === name);
+  });
+}
+
+async function loadConfig() {
+  try {
+    const r = await fetch('/api/config');
+    appConfig = await r.json();
+    document.getElementById('channel-name-header').textContent = appConfig.channel ?? 'Unknown Channel';
+    document.getElementById('manifest-url-val').textContent = appConfig.manifest_url ?? '';
+    document.getElementById('stremio-url-val').textContent = appConfig.stremio_url ?? '';
+    document.getElementById('stremio-install-btn').href = appConfig.stremio_url ?? '#';
+    
+    const deleteLabel = document.querySelector('#delete-tg-warning-channel strong');
+    if (deleteLabel) {
+      deleteLabel.textContent = appConfig.channel ?? 'Channel';
+    }
+  } catch(e) {
+    console.error('Failed to load API configuration', e);
+  }
+}
+
+async function loadStats() {
+  try {
+    const r = await fetch('/');
+    const d = await r.json();
+    document.getElementById('stat-movies').textContent = d.movies ?? '0';
+    document.getElementById('stat-dl').textContent = d.active_downloads ?? '0';
+    document.getElementById('stat-sync').textContent = d.sync_age_min !== null ? d.sync_age_min + 'm ago' : 'never';
+  } catch(e) {}
+}
+
+async function loadMovies() {
+  try {
+    const r = await fetch('/debug/movies');
+    allMovies = await r.json();
+    renderMovies(allMovies);
+  } catch(e) {
+    showToast('Failed to load media library', 'danger');
+  }
+}
+
+function badgeCls(q) {
+  if(q.includes('1080')) return 'b1080';
+  if(q.includes('2160') || q.includes('4K')) return 'b2160';
+  if(q.includes('720')) return 'b720';
+  return 'bdef';
+}
+
+function renderMovies(movies) {
+  const entries = Object.entries(movies);
+  const tbody = document.getElementById('movie-tbody');
+  
+  if(!entries.length) {
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:40px;">No movies indexed in the database. Run "Sync Channel" to scan your channel.</td></tr>';
+    return;
+  }
+  
+  tbody.innerHTML = entries.map(([id, m]) => {
+    const q = m.quality || 'Unknown';
+    const hasCache = m.cached_bytes > 0;
+    
+    // Cache UI representation
+    let cacheHtml = '';
+    if (m.is_done) {
+      cacheHtml = `<span class="badge b-cached">Fully Cached</span>`;
+    } else if (m.is_active || hasCache) {
+      const pctClass = m.is_active ? 'pbar pbar-active' : 'pbar';
+      cacheHtml = `
+        <div class="progress-cell">
+          <div class="pbar-container">
+            <div class="pbar-wrap"><div class="${pctClass}" style="width:${m.pct}%"></div></div>
+            <div class="progress-label">
+              <span>${m.is_active ? 'Downloading' : 'Paused'}</span>
+              <span>${m.pct}% (${m.cached_text})</span>
+            </div>
+          </div>
+        </div>
+      `;
+    } else {
+      cacheHtml = `<span style="color:var(--text-muted)">Not Cached</span>`;
+    }
+    
+    // Actions UI representation
+    let controlButtons = '';
+    if (m.is_active) {
+      controlButtons = `
+        <button class="btn btn-g btn-icon-only" title="Pause Download" onclick="triggerPause('${id}')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></svg>
+        </button>
+      `;
+    } else if (!m.is_done) {
+      controlButtons = `
+        <button class="btn btn-a btn-icon-only" title="Start Download" onclick="triggerDownload('${id}')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+        </button>
+      `;
+    }
+    
+    const clearCacheButton = hasCache ? `
+      <button class="btn btn-g btn-icon-only" title="Clear Disk Cache" onclick="triggerEvict('${id}')">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"></path><polyline points="21 3 21 8 16 8"></polyline><path d="M12 7v5l4 2"></path></svg>
+      </button>
+    ` : '';
+    
+    return `
+      <tr>
+        <td>
+          <div style="font-weight: 600; color: #fff; margin-bottom: 4px; max-width: 550px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${m.file_name}">
+            ${m.file_name || id}
+          </div>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <span class="badge ${badgeCls(q)}">${q}</span>
+            ${m.source ? `<span class="badge bdef">${m.source}</span>` : ''}
+            <span style="font-size:11px;color:var(--text-muted)">Msg ID: ${m.message_id}</span>
+          </div>
+        </td>
+        <td style="font-family: 'JetBrains Mono', monospace; font-weight: 500;">
+          ${m.file_size_text || '—'}
+        </td>
+        <td>
+          ${cacheHtml}
+        </td>
+        <td class="actions-cell">
+          <div class="actions-grp" style="justify-content: flex-end;">
+            ${controlButtons}
+            ${clearCacheButton}
+            <button class="btn btn-d btn-icon-only" title="Delete from Library" onclick="openDeleteModal('${id}')">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+            </button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join('');
+}
+
+function filterMovies(q) {
+  q = q.toLowerCase();
+  const filtered = Object.fromEntries(
+    Object.entries(allMovies).filter(([id, m]) => 
+      (m.file_name || id).toLowerCase().includes(q)
+    )
+  );
+  renderMovies(filtered);
+}
+
+function openDeleteModal(id) {
+  movieToDeleteId = id;
+  document.getElementById('delete-tg-checkbox').checked = false;
+  document.getElementById('delete-modal').classList.add('active');
+}
+
+function closeDeleteModal() {
+  document.getElementById('delete-modal').classList.remove('active');
+  movieToDeleteId = null;
+}
+
+async function confirmDelete() {
+  if(!movieToDeleteId) return;
+  const deleteTg = document.getElementById('delete-tg-checkbox').checked;
+  const btn = document.getElementById('modal-confirm-btn');
+  const oldText = btn.textContent;
+  
+  btn.disabled = true;
+  btn.textContent = 'Deleting...';
+  
+  try {
+    const r = await fetch(`/api/media/${movieToDeleteId}?delete_tg=${deleteTg}`, {
+      method: 'DELETE'
+    });
+    if(r.ok) {
+      showToast('Media item deleted successfully', 'success');
+      await loadMovies();
+      await loadStats();
+    } else {
+      const err = await r.json();
+      showToast('Deletion failed: ' + (err.detail || 'unknown error'), 'danger');
+    }
+  } catch(e) {
+    showToast('Network error during deletion', 'danger');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+    closeDeleteModal();
+  }
+}
+
+async function triggerDownload(id) {
+  try {
+    const r = await fetch(`/api/media/${id}/download`, { method: 'POST' });
+    if(r.ok) {
+      showToast('Download request scheduled', 'success');
+      await loadMovies();
+      await loadStats();
+    } else {
+      showToast('Failed to start download', 'danger');
+    }
+  } catch(e) {
+    showToast('Network error', 'danger');
+  }
+}
+
+async function triggerPause(id) {
+  try {
+    const r = await fetch(`/api/media/${id}/pause`, { method: 'POST' });
+    if(r.ok) {
+      showToast('Download task paused', 'warning');
+      await loadMovies();
+      await loadStats();
+    } else {
+      showToast('Failed to pause download', 'danger');
+    }
+  } catch(e) {
+    showToast('Network error', 'danger');
+  }
+}
+
+async function triggerEvict(id) {
+  try {
+    const r = await fetch(`/api/media/${id}/evict`, { method: 'POST' });
+    if(r.ok) {
+      showToast('Local cache wiped from storage', 'warning');
+      await loadMovies();
+      await loadStats();
+    } else {
+      showToast('Failed to clear cache', 'danger');
+    }
+  } catch(e) {
+    showToast('Network error', 'danger');
+  }
+}
+
+async function doSync() {
+  const btn = document.getElementById('sync-btn');
+  btn.disabled = true;
+  btn.textContent = 'Syncing...';
+  try {
+    const r = await fetch('/sync');
+    const d = await r.json();
+    showToast(`Successfully synced ${d.synced} movies`, 'success');
+    await loadMovies();
+    await loadStats();
+  } catch(e) {
+    showToast('Sync process failed', 'danger');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Sync Channel';
+  }
+}
+
+function cp(type, btn) {
+  const text = type === 'manifest' ? appConfig.manifest_url : appConfig.stremio_url;
+  if (!text) return;
+  navigator.clipboard.writeText(text);
+  const oldText = btn.textContent;
+  btn.textContent = 'Copied!';
+  btn.style.borderColor = 'var(--success)';
+  btn.style.color = 'var(--success-text)';
+  setTimeout(() => {
+    btn.textContent = oldText;
+    btn.style.borderColor = '';
+    btn.style.color = '';
+  }, 1500);
+}
+
+function showToast(message, type = 'success') {
+  const container = document.getElementById('toast-container');
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  toast.textContent = message;
+  container.appendChild(toast);
+  
+  setTimeout(() => toast.classList.add('show'), 10);
+  
+  setTimeout(() => {
+    toast.classList.remove('show');
+    setTimeout(() => toast.remove(), 300);
+  }, 3500);
+}
+
+// Initialize
+loadConfig();
+loadStats();
+loadMovies();
+
+// Auto-refresh stats and download progress every 4 seconds
+setInterval(() => {
+  loadStats();
+  loadMovies();
+}, 4000);
+</script>
+</body>
+</html>

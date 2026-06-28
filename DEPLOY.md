@@ -21,11 +21,16 @@ Railway dashboard → your service → **Variables**:
 API_ID              = (from my.telegram.org)
 API_HASH            = (from my.telegram.org)
 SESSION_STRING      = (generate below)
-CHANNEL_USERNAME    = @yourchannel
+CHANNEL_USERNAME    = @yourchannel (or -100xxxxxxxxx for private channels)
 BASE_URL            = https://<your-service>.up.railway.app
 SYNC_INTERVAL       = 300
 STREAM_CONCURRENCY  = 5
 ```
+
+> [!IMPORTANT]
+> **For Private Channels**:
+> 1. Use the numeric chat ID starting with `-100` (e.g. `CHANNEL_USERNAME = -1001234567890`) instead of a username.
+> 2. Ensure that the Telegram account used to generate the `SESSION_STRING` has joined the private channel, as it acts as a userbot to fetch messages/media.
 
 ### Generate SESSION_STRING
 
