@@ -50,7 +50,8 @@ async def _fetch_poster(filename: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=8) as c:
             r = await c.get(
-                f"https://v3-cinemeta.strem.io/catalog/movie/top/search={title} {year}.json"
+                f"https://v3-cinemeta.strem.io/catalog/movie/top/search={title} {year}.json",
+                follow_redirects=True
             )
             metas = r.json().get("metas", [])
             if metas and metas[0].get("poster"):
@@ -63,9 +64,13 @@ async def _fetch_poster(filename: str) -> str:
 async def get_cinemeta(type_name: str, imdb_id: str) -> tuple[str, str]:
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(f"https://v3-cinemeta.strem.io/meta/{type_name}/{imdb_id}.json")
+            r = await c.get(
+                f"https://v3-cinemeta.strem.io/meta/{type_name}/{imdb_id}.json",
+                follow_redirects=True
+            )
             meta = r.json().get("meta", {})
-            return meta.get("name", ""), str(meta.get("year", ""))
+            year_val = meta.get("year") or meta.get("releaseInfo") or ""
+            return meta.get("name", ""), str(year_val)
     except Exception:
         return "", ""
 
