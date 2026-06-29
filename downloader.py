@@ -256,14 +256,10 @@ class DownloadTask:
         """Main download loop. Sequential from play-head, skip already-downloaded.
         
         Strategy: Download in large 80MB batches to reduce request frequency.
-        Next batch starts when current batch is 90% consumed by player.
+        Downloads entire batch contiguously, then waits until 90% consumed before fetching next batch.
         """
         print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB, batch={DL_BATCH_SIZE/1024/1024:.0f}MB")
         
-        # Track current batch boundaries
-        current_batch_start = -1
-        current_batch_end = -1
-
         while True:
             # Find next gap starting from current play-head hint
             offset = self._find_next_gap(self._hint)
@@ -277,66 +273,60 @@ class DownloadTask:
             # Align to chunk boundary
             chunk_start = (offset // TG_CHUNK) * TG_CHUNK
             
-            # Check if we need to start a new batch
-            if current_batch_start < 0 or chunk_start >= current_batch_end:
-                # Start new 80MB batch
-                current_batch_start = chunk_start
-                current_batch_end = min(chunk_start + DL_BATCH_SIZE, self.file_size)
-                print(f"[dl:{self.movie_id}] new batch {chunk_start/1024/1024:.1f}MB - {current_batch_end/1024/1024:.1f}MB")
+            # Define batch boundaries: download 80MB contiguously from current position
+            batch_start = chunk_start
+            batch_end = min(chunk_start + DL_BATCH_SIZE, self.file_size)
+            print(f"[dl:{self.movie_id}] new batch {batch_start/1024/1024:.1f}MB - {batch_end/1024/1024:.1f}MB")
             
-            # Download one chunk within the batch
-            chunk_end   = min(chunk_start + TG_CHUNK - 1, current_batch_end - 1, self.file_size - 1)
-            chunk_len   = chunk_end - chunk_start + 1
+            # Download entire batch contiguously
+            current_offset = batch_start
+            while current_offset < batch_end:
+                chunk_end   = min(current_offset + TG_CHUNK - 1, batch_end - 1, self.file_size - 1)
+                chunk_len   = chunk_end - current_offset + 1
 
-            try:
-                msg = await self._fresh_msg()
-                data = bytearray()
-                async with self._semaphore:
-                    async for piece in self.streamer.yield_file(
-                        msg,
-                        offset=chunk_start,
-                        first_cut=0,
-                        last_cut=chunk_len,
-                        parts=1,
-                        chunk=TG_CHUNK,
-                    ):
-                        data.extend(piece)
+                try:
+                    msg = await self._fresh_msg()
+                    data = bytearray()
+                    async with self._semaphore:
+                        async for piece in self.streamer.yield_file(
+                            msg,
+                            offset=current_offset,
+                            first_cut=0,
+                            last_cut=chunk_len,
+                            parts=1,
+                            chunk=TG_CHUNK,
+                        ):
+                            data.extend(piece)
 
-                if data:
-                    await self.sparse.pwrite(bytes(data), chunk_start)
-                    self.dl_map.add(chunk_start, chunk_start + len(data) - 1)
-                    await self._persist_map()
-                    self._progress_event.set()
-                    self._progress_event = asyncio.Event()
-                    self._error_backoff = 1.0  # Reset backoff on success
-                else:
-                    raise Exception("No data received from Telegram")
+                    if data:
+                        await self.sparse.pwrite(bytes(data), current_offset)
+                        self.dl_map.add(current_offset, current_offset + len(data) - 1)
+                        await self._persist_map()
+                        self._progress_event.set()
+                        self._progress_event = asyncio.Event()
+                        self._error_backoff = 1.0  # Reset backoff on success
+                    else:
+                        raise Exception("No data received from Telegram")
 
-            except asyncio.CancelledError:
-                print(f"[dl:{self.movie_id}] cancelled at {offset/1024/1024:.1f}MB")
-                return
-            except Exception as e:
-                backoff_s = DL_MIN_BACKOFF * self._error_backoff
-                self._error_backoff = min(self._error_backoff * 2, 8)  # Cap at 8x
-                print(f"[dl:{self.movie_id}] error at {offset}: {e}, backoff {backoff_s:.1f}s")
-                await asyncio.sleep(backoff_s)
-                self._msg = None   # force re-fetch
-                continue
-
-            # Pause when current batch is mostly consumed (90%) — triggers next batch fetch
-            # This hides rate limit latency by pre-fetching large chunks ahead of time
-            bytes_in_batch = chunk_end - current_batch_start
-            if bytes_in_batch > 0:
-                trigger_point = int(DL_BATCH_SIZE * DL_LOOKAHEAD_TRIGGER)
-                if bytes_in_batch >= trigger_point and chunk_end < self.file_size - 1:
-                    # Batch nearly done, will trigger new batch on next iteration
-                    pass
-            
-            # Also pause if we're too far ahead of play-head within current batch
-            if (chunk_end - self._hint) > TG_CHUNK * 64:  # Keep at least 64MB buffer
-                await asyncio.sleep(0.5)
-                if self._done:
+                except asyncio.CancelledError:
+                    print(f"[dl:{self.movie_id}] cancelled at {current_offset/1024/1024:.1f}MB")
                     return
+                except Exception as e:
+                    backoff_s = DL_MIN_BACKOFF * self._error_backoff
+                    self._error_backoff = min(self._error_backoff * 2, 8)  # Cap at 8x
+                    print(f"[dl:{self.movie_id}] error at {current_offset}: {e}, backoff {backoff_s:.1f}s")
+                    await asyncio.sleep(backoff_s)
+                    self._msg = None   # force re-fetch
+                    continue
+                
+                current_offset = chunk_end + 1
+            
+            # Batch complete. Wait until 90% of this batch is consumed by player before fetching next batch
+            batch_trigger_point = batch_start + int((batch_end - batch_start) * DL_LOOKAHEAD_TRIGGER)
+            while self._hint < batch_trigger_point and not self._done:
+                await asyncio.sleep(1.0)
+            
+            # Loop will fetch next batch starting from new _hint position
 
         # Done
         self._done = True
@@ -378,6 +368,7 @@ class DownloadManager:
     """
     Singleton registry. main.py imports and uses this directly.
     Handles task creation, dedup, eviction.
+    Only one download active at a time to avoid Telegram rate limits.
     """
 
     def __init__(self):
@@ -385,7 +376,8 @@ class DownloadManager:
         self._maps:  dict[str, DownloadMap]  = {}
         self._files: dict[str, SparseFile]   = {}
         self._lock   = asyncio.Lock()
-        self._dl_semaphore = asyncio.Semaphore(1)  # 1 background downloader at a time
+        self._dl_semaphore = asyncio.Semaphore(1)  # STRICT: only 1 concurrent download to prevent rate limits
+        self._current_movie_id: Optional[str] = None  # Track which movie is actively downloading
 
     async def get_or_create(
         self,
@@ -399,7 +391,15 @@ class DownloadManager:
         async with self._lock:
             task = self._tasks.get(movie_id)
             if task and task._task and not task._task.done():
-                return task
+                return task  # Already downloading this movie
+
+            # If another movie is actively downloading, don't start a new one
+            # This prevents multiple concurrent downloads that trigger rate limits
+            if self._current_movie_id and self._current_movie_id != movie_id:
+                active_task = self._tasks.get(self._current_movie_id)
+                if active_task and active_task._task and not active_task._task.done():
+                    print(f"[dl:{movie_id}] waiting - download already active for {self._current_movie_id}")
+                    return active_task  # Return the active task instead of starting a new one
 
             # Restore map from Redis if exists (crash recovery)
             dl_map = await self._load_map(movie_id, redis)
@@ -429,6 +429,7 @@ class DownloadManager:
             )
             dt.start()
             self._tasks[movie_id] = dt
+            self._current_movie_id = movie_id  # Track active download
 
             # Update access timestamp for LRU eviction
             await redis.set(R_DL_TS.format(movie_id), str(time.time()), ex=86400)
