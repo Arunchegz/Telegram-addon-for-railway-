@@ -69,9 +69,10 @@ if CHANNEL_USERNAME:
 REDIS_URL          = os.getenv("REDIS_URL", "")
 SYNC_INTERVAL      = int(os.getenv("SYNC_INTERVAL", "300"))
 STREAM_CONCURRENCY = int(os.getenv("STREAM_CONCURRENCY", "5"))
-WAIT_TIMEOUT_S     = float(os.getenv("WAIT_TIMEOUT_S", "2.0"))
-STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "4"))
+WAIT_TIMEOUT_S     = float(os.getenv("WAIT_TIMEOUT_S", "1.0"))  # Reduced from 2.0s for aggressive Path C
+STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "1"))  # Reduced from 4 MB to 1 MB
 LOCAL_READ_CHUNK   = int(os.getenv("LOCAL_READ_CHUNK", str(1024 * 1024)))
+MIN_LOCAL_PREFETCH = int(os.getenv("MIN_LOCAL_PREFETCH", str(256 * 1024)))  # Min 256 KB to trigger Path C
 
 tg: Client = None
 redis_client: aioredis.Redis = None
@@ -473,8 +474,8 @@ async def proxy(movie_id: str, request: Request):
     """
     Four-path resolution (in order):
       A. Range fully in local SparseFile  -> pread, instant
-      B. Short wait for downloader catch-up -> pread if ready
-      C. Partial local prefix + live Telegram for remainder -> mixed stream
+      B. Short wait for downloader catch-up -> pread if ready (aggressive with reduced timeout)
+      C. Partial local prefix + live Telegram for remainder -> mixed stream (aggressive, triggers on MIN_LOCAL_PREFETCH)
       D. Fully live Telegram MTProto       -> StreamingResponse fallback
     X-Source header reveals which path was used (visible in dev tools).
     """
@@ -556,7 +557,7 @@ async def proxy(movie_id: str, request: Request):
             media_type=ctype_val,
         )
 
-    # ── Path B: wait for downloader to land the range ─────────────────────────
+    # ── Path B: wait for downloader to land the range (aggressive) ─────────────
     if task and not task.is_done() and dl_map and dl_file and dl_file.exists():
         deadline = time.time() + WAIT_TIMEOUT_S
         while time.time() < deadline:
@@ -571,14 +572,15 @@ async def proxy(movie_id: str, request: Request):
                 remaining = deadline - time.time()
                 if remaining <= 0: break
                 await asyncio.wait_for(asyncio.shield(task.progress_event().wait()),
-                                       timeout=min(remaining, 0.5))
+                                       timeout=min(remaining, 0.3))  # Reduced polling interval to 0.3s
             except asyncio.TimeoutError:
                 pass
 
-    # ── Path C: local prefix + live tail ─────────────────────────────────────
+    # ── Path C: local prefix + live tail (aggressive) ──────────────────────────
+    # Trigger on ANY available local data (>= MIN_LOCAL_PREFETCH), not just substantial coverage
     if dl_map and dl_file and dl_file.exists():
         covered = dl_map.covered_prefix(start)
-        if 0 < covered < total:
+        if covered >= MIN_LOCAL_PREFETCH and covered < total:
             rest_start = start + covered
 
             async def _mixed():

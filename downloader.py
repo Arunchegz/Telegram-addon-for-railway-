@@ -24,10 +24,10 @@ from typing import Optional
 
 import redis.asyncio as aioredis
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Constants ───────────────────────────────────────────────────────────[...]
 TG_CHUNK      = 1024 * 1024          # 1 MB per MTProto GetFile call
 DL_CHUNK      = TG_CHUNK             # download chunk size (same)
-DL_LOOKAHEAD  = 32 * 1024 * 1024    # download 32 MB ahead of play-head
+DL_LOOKAHEAD  = 8 * 1024 * 1024      # download 8 MB ahead of play-head (reduced from 32 MB for efficient streaming)
 STORAGE_DIR   = Path(os.getenv("STORAGE_DIR", "/tmp/tgstream"))
 MAX_LOCAL_GB  = float(os.getenv("MAX_LOCAL_GB", "10"))  # evict LRU beyond this
 
@@ -38,9 +38,9 @@ R_DL_PATH = "tgstream:dl:path:{}"   # local file path string
 R_DL_TS   = "tgstream:dl:ts:{}"     # last access timestamp (for LRU eviction)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────[...]
 # DownloadMap: sorted merged interval list
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────[...]
 class DownloadMap:
     """
     Sorted list of non-overlapping [start, end] byte intervals.
@@ -50,7 +50,7 @@ class DownloadMap:
     def __init__(self, intervals: list[list[int]] | None = None):
         self._ivs: list[list[int]] = intervals or []
 
-    # ── Serialisation ─────────────────────────────────────────────────────────
+    # ── Serialisation ────────────────────────────────────────────────────────�[...]
     def to_json(self) -> str:
         return json.dumps(self._ivs)
 
@@ -58,7 +58,7 @@ class DownloadMap:
     def from_json(cls, s: str | bytes) -> "DownloadMap":
         return cls(json.loads(s))
 
-    # ── Query ─────────────────────────────────────────────────────────────────
+    # ── Query ───────────────────────────────────────────────────────────[...]
     def has_range(self, start: int, end: int) -> bool:
         """True if [start, end] fully covered by stored intervals."""
         if not self._ivs:
@@ -96,7 +96,7 @@ class DownloadMap:
     def total_bytes(self) -> int:
         return sum(e - s + 1 for s, e in self._ivs)
 
-    # ── Mutate ────────────────────────────────────────────────────────────────
+    # ── Mutate ────────────────────────────────────────────────────────────[...]
     def add(self, start: int, end: int) -> None:
         """Insert [start, end] and merge overlapping/adjacent intervals."""
         new_iv = [start, end]
@@ -124,9 +124,9 @@ class DownloadMap:
         return DownloadMap([list(iv) for iv in self._ivs])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────�[...]
 # SparseFile: pre-truncated file, pwrite semantics
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────�[...]
 class SparseFile:
     """
     Pre-allocated (sparse) file. Supports concurrent pwrite + pread.
@@ -175,9 +175,9 @@ def _pread(path: Path, offset: int, length: int) -> bytes:
         return f.read(length)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────�[...]
 # DownloadTask: per-movie background downloader
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────�[...]
 class DownloadTask:
     """
     Sequentially downloads a Telegram file to local SparseFile.
@@ -216,7 +216,7 @@ class DownloadTask:
         self._msg = None                 # cached fresh message
         self._msg_fetched_at = 0.0
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Public API ─────────────────────────────────────────────────────────[...]
     def hint(self, offset: int):
         """Proxy tells downloader where player currently is."""
         if offset > self._hint:
@@ -237,7 +237,7 @@ class DownloadTask:
         if self._task and not self._task.done():
             self._task.cancel()
 
-    # ── Internal ──────────────────────────────────────────────────────────────
+    # ── Internal ───────────────────────────────────────────────────────────[...]
     async def _fresh_msg(self):
         """Re-fetch message if file_reference may have expired (>50min old)."""
         now = time.time()
@@ -248,7 +248,7 @@ class DownloadTask:
 
     async def _run(self):
         """Main download loop. Sequential from play-head, skip already-downloaded."""
-        print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB")
+        print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB, lookahead={DL_LOOKAHEAD/1024/1024:.0f}MB")
 
         while True:
             # Find next gap starting from current play-head hint
@@ -332,9 +332,9 @@ class DownloadTask:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────�[...]
 # DownloadManager: registry of active DownloadTasks
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────�[...]
 class DownloadManager:
     """
     Singleton registry. main.py imports and uses this directly.
