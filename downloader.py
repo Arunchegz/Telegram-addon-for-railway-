@@ -368,6 +368,7 @@ class DownloadManager:
     """
     Singleton registry. main.py imports and uses this directly.
     Handles task creation, dedup, eviction.
+    Only one download active at a time to avoid Telegram rate limits.
     """
 
     def __init__(self):
@@ -375,7 +376,8 @@ class DownloadManager:
         self._maps:  dict[str, DownloadMap]  = {}
         self._files: dict[str, SparseFile]   = {}
         self._lock   = asyncio.Lock()
-        self._dl_semaphore = asyncio.Semaphore(1)  # 1 background downloader at a time
+        self._dl_semaphore = asyncio.Semaphore(1)  # STRICT: only 1 concurrent download to prevent rate limits
+        self._current_movie_id: Optional[str] = None  # Track which movie is actively downloading
 
     async def get_or_create(
         self,
@@ -389,7 +391,15 @@ class DownloadManager:
         async with self._lock:
             task = self._tasks.get(movie_id)
             if task and task._task and not task._task.done():
-                return task
+                return task  # Already downloading this movie
+
+            # If another movie is actively downloading, don't start a new one
+            # This prevents multiple concurrent downloads that trigger rate limits
+            if self._current_movie_id and self._current_movie_id != movie_id:
+                active_task = self._tasks.get(self._current_movie_id)
+                if active_task and active_task._task and not active_task._task.done():
+                    print(f"[dl:{movie_id}] waiting - download already active for {self._current_movie_id}")
+                    return active_task  # Return the active task instead of starting a new one
 
             # Restore map from Redis if exists (crash recovery)
             dl_map = await self._load_map(movie_id, redis)
@@ -419,6 +429,7 @@ class DownloadManager:
             )
             dt.start()
             self._tasks[movie_id] = dt
+            self._current_movie_id = movie_id  # Track active download
 
             # Update access timestamp for LRU eviction
             await redis.set(R_DL_TS.format(movie_id), str(time.time()), ex=86400)
