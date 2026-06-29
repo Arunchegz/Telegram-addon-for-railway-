@@ -20,22 +20,28 @@ from pyrogram.file_id import FileId, FileType, ThumbnailSource
 from pyrogram.session import Auth, Session
 
 TG_CHUNK = 1024 * 1024
-MIN_THROTTLE_MS = 50   # Min 50ms between GetFile calls (Telegram req limit ~20/sec per session)
+MIN_THROTTLE_MS = 100  # 100ms between GetFile calls (~10 req/s); 50ms was too aggressive under concurrent streams
 MAX_BACKOFF_S = 60     # Max backoff on rate limit (Telegram's max is typically 2-60s)
 
 
 class ByteStreamer:
     def __init__(self, client: Client):
         self.client = client
-        self._last_invoke_time = 0.0  # Track last invoke time per instance
+        self._last_invoke_time = 0.0
+        self._throttle_lock = asyncio.Lock()  # Serialize throttle across concurrent streams
         self._backoff_until = {}  # Per-DC backoff state: {dc_id: until_timestamp}
 
     async def _throttle(self) -> None:
-        """Enforce minimum inter-request delay to avoid Telegram rate limits."""
-        elapsed = (time.time() - self._last_invoke_time) * 1000  # ms
-        if elapsed < MIN_THROTTLE_MS:
-            await asyncio.sleep((MIN_THROTTLE_MS - elapsed) / 1000)
-        self._last_invoke_time = time.time()
+        """Enforce minimum inter-request delay to avoid Telegram rate limits.
+
+        Lock ensures concurrent streams don't both read the same _last_invoke_time
+        and fire simultaneous GetFile calls — which caused the FloodWait cascade.
+        """
+        async with self._throttle_lock:
+            elapsed = (time.time() - self._last_invoke_time) * 1000
+            if elapsed < MIN_THROTTLE_MS:
+                await asyncio.sleep((MIN_THROTTLE_MS - elapsed) / 1000)
+            self._last_invoke_time = time.time()
 
     async def _wait_backoff(self, dc_id: int, flood_wait_s: int) -> None:
         """Exponential backoff with jitter on FloodWait."""
