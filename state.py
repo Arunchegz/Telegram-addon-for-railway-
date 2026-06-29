@@ -44,13 +44,22 @@ async def get_poster(redis: aioredis.Redis, filename: str) -> str:
 
 
 async def _fetch_poster(filename: str) -> str:
-    title, year = parse_title_year(filename)
+    # Detect series by SxxExx / Season N pattern
+    is_series = bool(re.search(r"[Ss]\d{1,2}[Ee]\d{1,3}|[Ss]eason\s*\d+|[Ee]pisode\s*\d+", filename))
+    if is_series:
+        title = parse_show_title(filename)
+        year = ""
+        catalog_type = "series"
+    else:
+        title, year = parse_title_year(filename)
+        catalog_type = "movie"
     if not title:
         return "https://via.placeholder.com/300x450?text=No+Poster"
+    query = f"{title} {year}".strip()
     try:
         async with httpx.AsyncClient(timeout=8) as c:
             r = await c.get(
-                f"https://v3-cinemeta.strem.io/catalog/movie/top/search={title} {year}.json",
+                f"https://v3-cinemeta.strem.io/catalog/{catalog_type}/top/search={query}.json",
                 follow_redirects=True
             )
             metas = r.json().get("metas", [])
