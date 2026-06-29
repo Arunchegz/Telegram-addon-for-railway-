@@ -202,6 +202,7 @@ class DownloadTask:
         byte_streamer,          # streamer.ByteStreamer
         fetch_msg_fn,           # async fn(msg_id) -> msg
         message_id: int,
+        dl_semaphore: asyncio.Semaphore,
     ):
         self.movie_id    = movie_id
         self.file_size   = file_size
@@ -211,6 +212,7 @@ class DownloadTask:
         self.streamer    = byte_streamer
         self.fetch_msg   = fetch_msg_fn
         self.message_id  = message_id
+        self._semaphore  = dl_semaphore
 
         self._task: Optional[asyncio.Task] = None
         self._hint: int = 0              # play-head hint from proxy
@@ -272,15 +274,16 @@ class DownloadTask:
             try:
                 msg = await self._fresh_msg()
                 data = bytearray()
-                async for piece in self.streamer.yield_file(
-                    msg,
-                    offset=chunk_start,
-                    first_cut=0,
-                    last_cut=chunk_len,
-                    parts=1,
-                    chunk=DL_CHUNK,
-                ):
-                    data.extend(piece)
+                async with self._semaphore:
+                    async for piece in self.streamer.yield_file(
+                        msg,
+                        offset=chunk_start,
+                        first_cut=0,
+                        last_cut=chunk_len,
+                        parts=1,
+                        chunk=DL_CHUNK,
+                    ):
+                        data.extend(piece)
 
                 if data:
                     await self.sparse.pwrite(bytes(data), chunk_start)
@@ -357,6 +360,7 @@ class DownloadManager:
         self._maps:  dict[str, DownloadMap]  = {}
         self._files: dict[str, SparseFile]   = {}
         self._lock   = asyncio.Lock()
+        self._dl_semaphore = asyncio.Semaphore(1)  # 1 background downloader at a time
 
     async def get_or_create(
         self,
@@ -396,6 +400,7 @@ class DownloadManager:
                 byte_streamer=byte_streamer,
                 fetch_msg_fn=fetch_msg_fn,
                 message_id=message_id,
+                dl_semaphore=self._dl_semaphore,
             )
             dt.start()
             self._tasks[movie_id] = dt
