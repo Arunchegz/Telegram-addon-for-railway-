@@ -1,5 +1,5 @@
 """
-downloader.py — Hybrid predictive download engine.
+downloader.py — Hybrid predictive download engine with rate-limit awareness.
 
 Architecture:
   SparseFile    — pre-truncated file, pwrite at any offset
@@ -8,6 +8,7 @@ Architecture:
   DownloadTask  — asyncio task per movie: sequential MTProto fetch
                   writes to SparseFile, updates DownloadMap in Redis
                   signals waiting proxy requests via asyncio.Event
+                  respects rate limits via adaptive backoff
 
 Player never knows — proxy checks DownloadMap before each range,
 serves local file if available, falls back to live Telegram otherwise.
@@ -30,6 +31,7 @@ DL_CHUNK      = TG_CHUNK             # download chunk size (same)
 DL_LOOKAHEAD  = 8 * 1024 * 1024      # download 8 MB ahead of play-head (reduced from 32 MB for efficient streaming)
 STORAGE_DIR   = Path(os.getenv("STORAGE_DIR", "/tmp/tgstream"))
 MAX_LOCAL_GB  = float(os.getenv("MAX_LOCAL_GB", "10"))  # evict LRU beyond this
+DL_MIN_BACKOFF = float(os.getenv("DL_MIN_BACKOFF", "2"))  # Backoff on error (seconds)
 
 # Redis key templates
 R_DL_MAP  = "tgstream:dl:map:{}"    # JSON [[start,end],...]
@@ -38,9 +40,9 @@ R_DL_PATH = "tgstream:dl:path:{}"   # local file path string
 R_DL_TS   = "tgstream:dl:ts:{}"     # last access timestamp (for LRU eviction)
 
 
-# ──────────────────────────────────────────────────────────────────[...]
+# ────────────────────────────────────────────────────────────────────────[...]
 # DownloadMap: sorted merged interval list
-# ──────────────────────────────────────────────────────────────────[...]
+# ────────────────────────────────────────────────────────────────────────[...]
 class DownloadMap:
     """
     Sorted list of non-overlapping [start, end] byte intervals.
@@ -50,7 +52,7 @@ class DownloadMap:
     def __init__(self, intervals: list[list[int]] | None = None):
         self._ivs: list[list[int]] = intervals or []
 
-    # ── Serialisation ────────────────────────────────────────────────────────�[...]
+    # ── Serialisation ────────────────────────────────────────────────────────[...]
     def to_json(self) -> str:
         return json.dumps(self._ivs)
 
@@ -96,7 +98,7 @@ class DownloadMap:
     def total_bytes(self) -> int:
         return sum(e - s + 1 for s, e in self._ivs)
 
-    # ── Mutate ────────────────────────────────────────────────────────────[...]
+    # ── Mutate ──────────────────────────────────────────────────────────[...]
     def add(self, start: int, end: int) -> None:
         """Insert [start, end] and merge overlapping/adjacent intervals."""
         new_iv = [start, end]
@@ -124,9 +126,9 @@ class DownloadMap:
         return DownloadMap([list(iv) for iv in self._ivs])
 
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ────────────────────────────────────────────────────────────────────────[...]
 # SparseFile: pre-truncated file, pwrite semantics
-# ────────────────────────────────────────────────────────────────�[...]
+# ────────────────────────────────────────────────────────────────────────[...]
 class SparseFile:
     """
     Pre-allocated (sparse) file. Supports concurrent pwrite + pread.
@@ -175,9 +177,9 @@ def _pread(path: Path, offset: int, length: int) -> bytes:
         return f.read(length)
 
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ────────────────────────────────────────────────────────────────────────[...]
 # DownloadTask: per-movie background downloader
-# ────────────────────────────────────────────────────────────────�[...]
+# ────────────────────────────────────────────────────────────────────────[...]
 class DownloadTask:
     """
     Sequentially downloads a Telegram file to local SparseFile.
@@ -187,6 +189,7 @@ class DownloadTask:
     or task cancelled (eviction / shutdown).
     
     The proxy signals play-head via hint(offset) so downloader stays ahead.
+    Handles rate limits gracefully with exponential backoff.
     """
 
     def __init__(
@@ -215,6 +218,7 @@ class DownloadTask:
         self._done = False
         self._msg = None                 # cached fresh message
         self._msg_fetched_at = 0.0
+        self._error_backoff = 1.0        # Exponential backoff multiplier
 
     # ── Public API ─────────────────────────────────────────────────────────[...]
     def hint(self, offset: int):
@@ -237,7 +241,7 @@ class DownloadTask:
         if self._task and not self._task.done():
             self._task.cancel()
 
-    # ── Internal ───────────────────────────────────────────────────────────[...]
+    # ── Internal ─────────────────────────────────────────────────────────[...]
     async def _fresh_msg(self):
         """Re-fetch message if file_reference may have expired (>50min old)."""
         now = time.time()
@@ -284,6 +288,7 @@ class DownloadTask:
                     await self._persist_map()
                     self._progress_event.set()
                     self._progress_event = asyncio.Event()
+                    self._error_backoff = 1.0  # Reset backoff on success
                 else:
                     raise Exception("No data received from Telegram")
 
@@ -291,8 +296,10 @@ class DownloadTask:
                 print(f"[dl:{self.movie_id}] cancelled at {offset/1024/1024:.1f}MB")
                 return
             except Exception as e:
-                print(f"[dl:{self.movie_id}] error at {offset}: {e}, retry in 5s")
-                await asyncio.sleep(5)
+                backoff_s = DL_MIN_BACKOFF * self._error_backoff
+                self._error_backoff = min(self._error_backoff * 2, 8)  # Cap at 8x
+                print(f"[dl:{self.movie_id}] error at {offset}: {e}, backoff {backoff_s:.1f}s")
+                await asyncio.sleep(backoff_s)
                 self._msg = None   # force re-fetch
                 continue
 
@@ -332,9 +339,9 @@ class DownloadTask:
         )
 
 
-# ────────────────────────────────────────────────────────────────�[...]
+# ────────────────────────────────────────────────────────────────────────[...]
 # DownloadManager: registry of active DownloadTasks
-# ────────────────────────────────────────────────────────────────�[...]
+# ────────────────────────────────────────────────────────────────────────[...]
 class DownloadManager:
     """
     Singleton registry. main.py imports and uses this directly.
