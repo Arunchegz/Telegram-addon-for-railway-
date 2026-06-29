@@ -27,8 +27,8 @@ import redis.asyncio as aioredis
 
 # ── Constants ───────────────────────────────────────────────────────────[...]
 TG_CHUNK      = 1024 * 1024          # 1 MB per MTProto GetFile call
-DL_CHUNK      = TG_CHUNK             # download chunk size (same)
-DL_LOOKAHEAD  = 64 * 1024 * 1024     # pause downloader when 64 MB ahead of play-head (~60-120s buffer)
+DL_BATCH_SIZE = 80 * 1024 * 1024     # 80 MB batch download size (reduces request frequency)
+DL_LOOKAHEAD_TRIGGER = 0.90          # Trigger next batch when 90% of current batch consumed
 STORAGE_DIR   = Path(os.getenv("STORAGE_DIR", "/tmp/tgstream"))
 MAX_LOCAL_GB  = float(os.getenv("MAX_LOCAL_GB", "10"))  # evict LRU beyond this
 DL_MIN_BACKOFF = float(os.getenv("DL_MIN_BACKOFF", "2"))  # Backoff on error (seconds)
@@ -253,8 +253,16 @@ class DownloadTask:
         return self._msg
 
     async def _run(self):
-        """Main download loop. Sequential from play-head, skip already-downloaded."""
-        print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB, lookahead={DL_LOOKAHEAD/1024/1024:.0f}MB")
+        """Main download loop. Sequential from play-head, skip already-downloaded.
+        
+        Strategy: Download in large 80MB batches to reduce request frequency.
+        Next batch starts when current batch is 90% consumed by player.
+        """
+        print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB, batch={DL_BATCH_SIZE/1024/1024:.0f}MB")
+        
+        # Track current batch boundaries
+        current_batch_start = -1
+        current_batch_end = -1
 
         while True:
             # Find next gap starting from current play-head hint
@@ -267,8 +275,17 @@ class DownloadTask:
                     break
 
             # Align to chunk boundary
-            chunk_start = (offset // DL_CHUNK) * DL_CHUNK
-            chunk_end   = min(chunk_start + DL_CHUNK - 1, self.file_size - 1)
+            chunk_start = (offset // TG_CHUNK) * TG_CHUNK
+            
+            # Check if we need to start a new batch
+            if current_batch_start < 0 or chunk_start >= current_batch_end:
+                # Start new 80MB batch
+                current_batch_start = chunk_start
+                current_batch_end = min(chunk_start + DL_BATCH_SIZE, self.file_size)
+                print(f"[dl:{self.movie_id}] new batch {chunk_start/1024/1024:.1f}MB - {current_batch_end/1024/1024:.1f}MB")
+            
+            # Download one chunk within the batch
+            chunk_end   = min(chunk_start + TG_CHUNK - 1, current_batch_end - 1, self.file_size - 1)
             chunk_len   = chunk_end - chunk_start + 1
 
             try:
@@ -281,7 +298,7 @@ class DownloadTask:
                         first_cut=0,
                         last_cut=chunk_len,
                         parts=1,
-                        chunk=DL_CHUNK,
+                        chunk=TG_CHUNK,
                     ):
                         data.extend(piece)
 
@@ -306,10 +323,18 @@ class DownloadTask:
                 self._msg = None   # force re-fetch
                 continue
 
-            # Pause when sufficiently ahead of play-head — lets proxy get
-            # uncontested MTProto bandwidth and stops full-file download.
-            while (chunk_end - self._hint) > DL_LOOKAHEAD:
-                await asyncio.sleep(1.0)
+            # Pause when current batch is mostly consumed (90%) — triggers next batch fetch
+            # This hides rate limit latency by pre-fetching large chunks ahead of time
+            bytes_in_batch = chunk_end - current_batch_start
+            if bytes_in_batch > 0:
+                trigger_point = int(DL_BATCH_SIZE * DL_LOOKAHEAD_TRIGGER)
+                if bytes_in_batch >= trigger_point and chunk_end < self.file_size - 1:
+                    # Batch nearly done, will trigger new batch on next iteration
+                    pass
+            
+            # Also pause if we're too far ahead of play-head within current batch
+            if (chunk_end - self._hint) > TG_CHUNK * 64:  # Keep at least 64MB buffer
+                await asyncio.sleep(0.5)
                 if self._done:
                     return
 
@@ -323,8 +348,8 @@ class DownloadTask:
         """Find first byte >= from_offset not in dl_map."""
         ivs = self.dl_map._ivs
         if not ivs:
-            return (from_offset // DL_CHUNK) * DL_CHUNK
-        candidate = (from_offset // DL_CHUNK) * DL_CHUNK
+            return (from_offset // TG_CHUNK) * TG_CHUNK
+        candidate = (from_offset // TG_CHUNK) * TG_CHUNK
         for s, e in ivs:
             if candidate < s:
                 return candidate
