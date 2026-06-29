@@ -34,7 +34,7 @@ from pyrogram.errors import FloodWait
 
 import pyrogram.utils
 import state as st
-from downloader import DownloadMap, download_manager, STORAGE_DIR
+from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES
 from streamer import ByteStreamer, TG_CHUNK
 
 # Monkey-patch Pyrogram to support newer 64-bit channel/chat IDs (> 32-bit suffixes)
@@ -72,7 +72,7 @@ STREAM_CONCURRENCY = int(os.getenv("STREAM_CONCURRENCY", "3"))  # live proxy str
 WAIT_TIMEOUT_S     = float(os.getenv("WAIT_TIMEOUT_S", "1.0"))  # Reduced from 2.0s for aggressive Path C
 STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "1"))  # Reduced from 4 MB to 1 MB
 LOCAL_READ_CHUNK   = int(os.getenv("LOCAL_READ_CHUNK", str(1024 * 1024)))
-MIN_LOCAL_PREFETCH = int(os.getenv("MIN_LOCAL_PREFETCH", str(256 * 1024)))  # Min 256 KB to trigger Path C
+# MIN_LOCAL_PREFETCH replaced by LOCAL_READY_BYTES from downloader (default 50MB)
 
 tg: Client = None
 redis_client: aioredis.Redis = None
@@ -520,7 +520,7 @@ async def proxy(movie_id: str, request: Request):
     Four-path resolution (in order):
       A. Range fully in local SparseFile  -> pread, instant
       B. Short wait for downloader catch-up -> pread if ready (aggressive with reduced timeout)
-      C. Partial local prefix + live Telegram for remainder -> mixed stream (aggressive, triggers on MIN_LOCAL_PREFETCH)
+      C. Partial local prefix + live Telegram for remainder -> mixed stream (triggers when LOCAL_READY_BYTES ahead cached)
       D. Fully live Telegram MTProto       -> StreamingResponse fallback
     X-Source header reveals which path was used (visible in dev tools).
     """

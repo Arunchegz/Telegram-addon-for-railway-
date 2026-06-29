@@ -26,12 +26,12 @@ from typing import Optional
 import redis.asyncio as aioredis
 
 # ── Constants ───────────────────────────────────────────────────────────[...]
-TG_CHUNK      = 1024 * 1024          # 1 MB per MTProto GetFile call
-DL_BATCH_SIZE = 80 * 1024 * 1024     # 80 MB batch download size (reduces request frequency)
-DL_LOOKAHEAD_TRIGGER = 0.90          # Trigger next batch when 90% of current batch consumed
-STORAGE_DIR   = Path(os.getenv("STORAGE_DIR", "/tmp/tgstream"))
-MAX_LOCAL_GB  = float(os.getenv("MAX_LOCAL_GB", "10"))  # evict LRU beyond this
+TG_CHUNK       = 1024 * 1024          # 1 MB per MTProto GetFile call
+LOCAL_READY_MB = int(os.getenv("LOCAL_READY_MB", "50"))  # Switch to local when this many MB ahead cached
+STORAGE_DIR    = Path(os.getenv("STORAGE_DIR", "/tmp/tgstream"))
+MAX_LOCAL_GB   = float(os.getenv("MAX_LOCAL_GB", "10"))  # evict LRU beyond this
 DL_MIN_BACKOFF = float(os.getenv("DL_MIN_BACKOFF", "2"))  # Backoff on error (seconds)
+LOCAL_READY_BYTES = LOCAL_READY_MB * 1024 * 1024
 
 # Redis key templates
 R_DL_MAP  = "tgstream:dl:map:{}"    # JSON [[start,end],...]
@@ -264,109 +264,76 @@ class DownloadTask:
         return self._msg
 
     async def _run(self):
-        """Background batch downloader — play-head anchored.
+        """Continuous background downloader from play-head to EOF.
 
         Strategy:
-          1. Wait for proxy to signal play-head position via hint().
-          2. Download one 80 MB batch starting at play-head (skip already-cached ranges).
-          3. After batch complete: wait until 90% of that batch is consumed, THEN
-             anchor next batch at the current play-head (which may have jumped ahead).
-          4. Repeat until EOF.
-
-        The proxy streams live from Telegram until dl_map covers the requested range,
-        then transparently switches to local reads.  This loop never blocks playback.
+          - Download sequentially from current hint position to end of file.
+          - Skip already-cached chunks.
+          - On seek (hint jumps > 30MB): re-anchor to new position immediately.
+          - Never waits for 90% triggers or batch boundaries.
+          - Proxy switches to local once LOCAL_READY_BYTES ahead of hint is cached.
         """
-        print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB batch={DL_BATCH_SIZE/1024/1024:.0f}MB")
+        print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB")
 
-        while True:
-            # ── Pick batch start: anchor at current play-head, skip cached bytes ──
-            batch_anchor = (self._hint // TG_CHUNK) * TG_CHUNK  # align to chunk boundary
-            batch_start  = self._find_next_gap(batch_anchor)
-            if batch_start >= self.file_size:
-                # Everything after play-head cached; look from file start for any gaps
-                batch_start = self._find_next_gap(0)
-                if batch_start >= self.file_size:
-                    break  # Entire file cached
+        current_offset = (self._hint // TG_CHUNK) * TG_CHUNK
 
-            batch_end = min(batch_start + DL_BATCH_SIZE, self.file_size)
-            print(f"[dl:{self.movie_id}] batch {batch_start/1024/1024:.1f}–{batch_end/1024/1024:.1f} MB (hint={self._hint/1024/1024:.1f} MB)")
-
-            # Reset seek event for this batch
-            self._seek_event.clear()
-
-            # ── Download batch chunk-by-chunk, skipping already-cached ranges ──
-            current_offset = batch_start
-            while current_offset < batch_end:
-                # Player seeked far ahead — abort this batch, re-anchor immediately
-                if self._seek_event.is_set():
-                    print(f"[dl:{self.movie_id}] seek detected at {current_offset/1024/1024:.1f} MB, re-anchoring to {self._hint/1024/1024:.1f} MB")
-                    break
-
-                # Skip if already in dl_map (e.g. live proxy already wrote these bytes — not current
-                # design but future-proof)
-                if self.dl_map.has_range(current_offset, min(current_offset + TG_CHUNK - 1, batch_end - 1)):
-                    current_offset = min(current_offset + TG_CHUNK, batch_end)
-                    continue
-
-                chunk_end = min(current_offset + TG_CHUNK - 1, batch_end - 1, self.file_size - 1)
-                chunk_len = chunk_end - current_offset + 1
-
-                try:
-                    msg  = await self._fresh_msg()
-                    data = bytearray()
-                    async with self._semaphore:
-                        async for piece in self.streamer.yield_file(
-                            msg,
-                            offset=current_offset,
-                            first_cut=0,
-                            last_cut=chunk_len,
-                            parts=1,
-                            chunk=TG_CHUNK,
-                        ):
-                            data.extend(piece)
-
-                    if not data:
-                        raise Exception("No data received from Telegram")
-
-                    await self.sparse.pwrite(bytes(data), current_offset)
-                    self.dl_map.add(current_offset, current_offset + len(data) - 1)
-                    await self._persist_map()
-                    self._progress_event.set()
-                    self._progress_event = asyncio.Event()
-                    self._error_backoff = 1.0
-
-                except asyncio.CancelledError:
-                    print(f"[dl:{self.movie_id}] cancelled at {current_offset/1024/1024:.1f} MB")
-                    return
-                except Exception as e:
-                    backoff_s = DL_MIN_BACKOFF * self._error_backoff
-                    self._error_backoff = min(self._error_backoff * 2, 8)
-                    print(f"[dl:{self.movie_id}] error at {current_offset/1024/1024:.1f} MB: {e}, backoff {backoff_s:.1f}s")
-                    await asyncio.sleep(backoff_s)
-                    self._msg = None
-                    continue
-
-                current_offset = chunk_end + 1
-
-            # ── Batch complete (or seek-aborted) ─────────────────────────────
-            # Skip wait if seek fired — re-anchor immediately at new hint
+        while current_offset < self.file_size:
+            # Re-anchor if seek jumped ahead
             if self._seek_event.is_set():
-                continue  # back to top of while True, re-anchors at self._hint
+                self._seek_event.clear()
+                current_offset = (self._hint // TG_CHUNK) * TG_CHUNK
+                print(f"[dl:{self.movie_id}] seek → re-anchor at {current_offset/1024/1024:.1f}MB")
 
-            # Normal completion: wait until 90% of batch consumed before next batch.
-            # Also break out if hint exceeds batch_end (player seeked past this batch).
-            trigger = batch_start + int((batch_end - batch_start) * DL_LOOKAHEAD_TRIGGER)
-            # Guard: trigger must be reachable (not beyond file size)
-            if trigger >= self.file_size:
-                continue  # file nearly done, just loop and find remaining gaps
-            print(f"[dl:{self.movie_id}] batch done, waiting for hint>{trigger/1024/1024:.1f} MB")
-            while self._hint < trigger and not self._seek_event.is_set():
-                await asyncio.sleep(0.5)
+            # Skip already-cached chunk
+            chunk_end = min(current_offset + TG_CHUNK - 1, self.file_size - 1)
+            if self.dl_map.has_range(current_offset, chunk_end):
+                current_offset = chunk_end + 1
+                continue
+
+            chunk_len = chunk_end - current_offset + 1
+
+            try:
+                msg  = await self._fresh_msg()
+                data = bytearray()
+                async with self._semaphore:
+                    async for piece in self.streamer.yield_file(
+                        msg,
+                        offset=current_offset,
+                        first_cut=0,
+                        last_cut=chunk_len,
+                        parts=1,
+                        chunk=TG_CHUNK,
+                    ):
+                        data.extend(piece)
+
+                if not data:
+                    raise Exception("No data from Telegram")
+
+                await self.sparse.pwrite(bytes(data), current_offset)
+                self.dl_map.add(current_offset, current_offset + len(data) - 1)
+                await self._persist_map()
+                self._progress_event.set()
+                self._progress_event = asyncio.Event()
+                self._error_backoff = 1.0
+
+            except asyncio.CancelledError:
+                print(f"[dl:{self.movie_id}] cancelled at {current_offset/1024/1024:.1f}MB")
+                return
+            except Exception as e:
+                backoff_s = DL_MIN_BACKOFF * self._error_backoff
+                self._error_backoff = min(self._error_backoff * 2, 8)
+                print(f"[dl:{self.movie_id}] error at {current_offset/1024/1024:.1f}MB: {e}, backoff {backoff_s:.1f}s")
+                await asyncio.sleep(backoff_s)
+                self._msg = None
+                continue
+
+            current_offset = chunk_end + 1
 
         # EOF
         self._done = True
         await self.redis.set(R_DL_DONE.format(self.movie_id), "1")
-        print(f"[dl:{self.movie_id}] complete {self.dl_map.total_bytes()/1024/1024:.1f} MB cached")
+        print(f"[dl:{self.movie_id}] complete {self.dl_map.total_bytes()/1024/1024:.1f}MB cached")
+
 
     def _find_next_gap(self, from_offset: int) -> int:
         """Find first byte >= from_offset not in dl_map."""
