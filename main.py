@@ -267,17 +267,12 @@ async def debug_downloads():
 
 @app.get("/catalog/{type}/{id}.json")
 async def catalog(type: str, id: str):
-    # Check if sync is needed (trigger sync on catalog request)
-    last_sync = await redis_client.get(st.R_SYNC_TS)
-    now = time.time()
-    SYNC_INTERVAL_SEC = 300  # 5 minutes
-    
-    if not last_sync or (now - float(last_sync)) > SYNC_INTERVAL_SEC:
-        print(f"Catalog request: triggering fresh sync (last sync was {round((now - float(last_sync))/60, 1) if last_sync else 'never'} min ago)")
-        try:
-            await _sync_channel()
-        except Exception as e:
-            print(f"Catalog sync failed: {e}")
+    # Always trigger sync on catalog request for freshest data
+    print(f"Catalog request: triggering fresh sync")
+    try:
+        await _sync_channel()
+    except Exception as e:
+        print(f"Catalog sync failed: {e}")
     
     movies = await st.load_movies(redis_client)
     def is_series(m): return bool(re.search(r"s\d{2}e\d{2}|season\s*\d|episode\s*\d", m.get("file_name","").lower()))
