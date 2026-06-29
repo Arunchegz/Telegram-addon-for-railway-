@@ -475,6 +475,44 @@ async def _yield_local_file(dl_file, start: int, length: int, request: Request):
         yield data
 
 
+
+async def _hydrate_if_cached(movie_id: str, file_size: int) -> bool:
+    """
+    Returns True if the file is fully downloaded locally and ready to serve.
+    Side-effect: ensures download_manager._maps/_files are populated for this movie_id
+    so proxy Path A can pread immediately.
+    Never touches Telegram.
+    """
+    sparse_path = STORAGE_DIR / f"{movie_id}.bin"
+    if not sparse_path.exists():
+        return False
+
+    # In-memory map already covers full range?
+    dl_map = download_manager.get_map(movie_id)
+    dl_file = download_manager.get_file(movie_id)
+    if dl_map and dl_map.has_range(0, file_size - 1):
+        return True
+
+    # Cheap Redis flag check
+    done_val = await redis_client.get(f"tgstream:dl:done:{movie_id}")
+    if done_val != b"1":
+        # Last resort: load map and verify coverage
+        dl_map = await download_manager._load_map(movie_id, redis_client)
+        if not dl_map.has_range(0, file_size - 1):
+            return False
+        # Coverage confirmed — backfill flag
+        await redis_client.set(f"tgstream:dl:done:{movie_id}", b"1")
+
+    # Hydrate in-memory state so Path A works
+    if download_manager.get_map(movie_id) is None:
+        dl_map = await download_manager._load_map(movie_id, redis_client)
+        download_manager._maps[movie_id] = dl_map
+    if download_manager.get_file(movie_id) is None:
+        from downloader import SparseFile
+        download_manager._files[movie_id] = SparseFile(sparse_path)
+
+    return True
+
 # ─── HYBRID PROXY — the heart of v2 ──────────────────────────────────────────
 @app.api_route("/proxy/{movie_id}", methods=["GET", "HEAD"])
 async def proxy(movie_id: str, request: Request):
@@ -509,8 +547,10 @@ async def proxy(movie_id: str, request: Request):
             "Cache-Control": "public, max-age=3600", "ETag": etag,
         })
 
-    # Ensure download running
-    _schedule(_ensure_download(movie_id, file_size, movie["message_id"]))
+    # ── Skip Telegram entirely if file already fully cached ─────────────────
+    _cached = await _hydrate_if_cached(movie_id, file_size)
+    if not _cached:
+        _schedule(_ensure_download(movie_id, file_size, movie["message_id"]))
 
     # Parse Range
     start, end = 0, file_size - 1

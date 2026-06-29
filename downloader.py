@@ -387,11 +387,33 @@ class DownloadManager:
         redis: aioredis.Redis,
         byte_streamer,
         fetch_msg_fn,
-    ) -> DownloadTask:
+    ) -> Optional[DownloadTask]:
         async with self._lock:
             task = self._tasks.get(movie_id)
             if task and task._task and not task._task.done():
                 return task  # Already downloading this movie
+
+            # ── Fast-path: file fully cached — skip Telegram entirely ─────────
+            sparse_path = STORAGE_DIR / f"{movie_id}.bin"
+            if sparse_path.exists():
+                done_val = await redis.get(R_DL_DONE.format(movie_id))
+                if done_val == b"1":
+                    dl_map = await self._load_map(movie_id, redis)
+                    self._maps[movie_id] = dl_map
+                    if movie_id not in self._files:
+                        self._files[movie_id] = SparseFile(sparse_path)
+                    print(f"[dl:{movie_id}] fully cached — skipping downloader")
+                    return None
+                # Fallback: interval coverage check (Redis flag may be missing after crash)
+                dl_map = await self._load_map(movie_id, redis)
+                if dl_map.has_range(0, file_size - 1):
+                    self._maps[movie_id] = dl_map
+                    if movie_id not in self._files:
+                        self._files[movie_id] = SparseFile(sparse_path)
+                    await redis.set(R_DL_DONE.format(movie_id), b"1")
+                    print(f"[dl:{movie_id}] fully cached (map verify) — skipping downloader")
+                    return None
+            # ─────────────────────────────────────────────────────────────────
 
             # If another movie is actively downloading, don't start a new one
             # This prevents multiple concurrent downloads that trigger rate limits
