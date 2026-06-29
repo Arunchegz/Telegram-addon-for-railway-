@@ -348,10 +348,19 @@ class DownloadTask:
 
                 current_offset = chunk_end + 1
 
-            # ── Batch complete — wait until 90% consumed, then loop with fresh hint ──
+            # ── Batch complete (or seek-aborted) ─────────────────────────────
+            # Skip wait if seek fired — re-anchor immediately at new hint
+            if self._seek_event.is_set():
+                continue  # back to top of while True, re-anchors at self._hint
+
+            # Normal completion: wait until 90% of batch consumed before next batch.
+            # Also break out if hint exceeds batch_end (player seeked past this batch).
             trigger = batch_start + int((batch_end - batch_start) * DL_LOOKAHEAD_TRIGGER)
+            # Guard: trigger must be reachable (not beyond file size)
+            if trigger >= self.file_size:
+                continue  # file nearly done, just loop and find remaining gaps
             print(f"[dl:{self.movie_id}] batch done, waiting for hint>{trigger/1024/1024:.1f} MB")
-            while self._hint < trigger:
+            while self._hint < trigger and not self._seek_event.is_set():
                 await asyncio.sleep(0.5)
 
         # EOF
