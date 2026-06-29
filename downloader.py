@@ -28,7 +28,7 @@ import redis.asyncio as aioredis
 # ── Constants ───────────────────────────────────────────────────────────[...]
 TG_CHUNK      = 1024 * 1024          # 1 MB per MTProto GetFile call
 DL_CHUNK      = TG_CHUNK             # download chunk size (same)
-DL_LOOKAHEAD  = 32 * 1024 * 1024     # pause downloader when 32 MB ahead of play-head (~30-60s buffer)
+DL_LOOKAHEAD  = 64 * 1024 * 1024     # pause downloader when 64 MB ahead of play-head (~60-120s buffer)
 STORAGE_DIR   = Path(os.getenv("STORAGE_DIR", "/tmp/tgstream"))
 MAX_LOCAL_GB  = float(os.getenv("MAX_LOCAL_GB", "10"))  # evict LRU beyond this
 DL_MIN_BACKOFF = float(os.getenv("DL_MIN_BACKOFF", "2"))  # Backoff on error (seconds)
