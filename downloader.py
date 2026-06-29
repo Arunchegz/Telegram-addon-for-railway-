@@ -454,8 +454,13 @@ class DownloadManager:
             if self._current_movie_id and self._current_movie_id != movie_id:
                 active_task = self._tasks.get(self._current_movie_id)
                 if active_task and active_task._task and not active_task._task.done():
-                    print(f"[dl:{movie_id}] waiting - download already active for {self._current_movie_id}")
-                    return active_task  # Return the active task instead of starting a new one
+                    print(f"[dl:{movie_id}] cancelling {self._current_movie_id} — switching movie")
+                    active_task.cancel()
+                    # Wait briefly for cancellation to complete
+                    try:
+                        await asyncio.wait_for(asyncio.shield(active_task._task), timeout=1.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
 
             # Restore map from Redis if exists (crash recovery)
             dl_map = await self._load_map(movie_id, redis)
