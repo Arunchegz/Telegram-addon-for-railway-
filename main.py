@@ -68,7 +68,7 @@ if CHANNEL_USERNAME:
 
 REDIS_URL          = os.getenv("REDIS_URL", "")
 SYNC_INTERVAL      = int(os.getenv("SYNC_INTERVAL", "300"))
-STREAM_CONCURRENCY = int(os.getenv("STREAM_CONCURRENCY", "5"))
+STREAM_CONCURRENCY = int(os.getenv("STREAM_CONCURRENCY", "3"))  # live proxy streams; keep low to avoid MTProto congestion
 WAIT_TIMEOUT_S     = float(os.getenv("WAIT_TIMEOUT_S", "1.0"))  # Reduced from 2.0s for aggressive Path C
 STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "1"))  # Reduced from 4 MB to 1 MB
 LOCAL_READ_CHUNK   = int(os.getenv("LOCAL_READ_CHUNK", str(1024 * 1024)))
@@ -604,26 +604,8 @@ async def proxy(movie_id: str, request: Request):
             media_type=ctype_val,
         )
 
-    # ── Path B: wait for downloader to land the range (aggressive) ─────────────
-    if task and not task.is_done() and dl_map and dl_file and dl_file.exists():
-        deadline = time.time() + WAIT_TIMEOUT_S
-        while time.time() < deadline:
-            if dl_map.covered_prefix(start) >= total:
-                return StreamingResponse(
-                    _yield_local_file(dl_file, start, total, request),
-                    status_code=206,
-                    headers={**headers, "X-Source": "local-waited"},
-                    media_type=ctype_val,
-                )
-            try:
-                remaining = deadline - time.time()
-                if remaining <= 0: break
-                await asyncio.wait_for(asyncio.shield(task.progress_event().wait()),
-                                       timeout=min(remaining, 0.3))  # Reduced polling interval to 0.3s
-            except asyncio.TimeoutError:
-                pass
-
-    # ── Path C: local prefix + live tail (aggressive) ──────────────────────────
+    # ── Path C: local prefix + live tail ────────────────────────────────────────
+    # (Path B removed: live-first strategy means waiting is always wrong)
     # Trigger on ANY available local data (>= MIN_LOCAL_PREFETCH), not just substantial coverage
     if dl_map and dl_file and dl_file.exists():
         covered = dl_map.covered_prefix(start)
@@ -647,51 +629,9 @@ async def proxy(movie_id: str, request: Request):
             return StreamingResponse(_mixed(), status_code=206,
                                      headers={**headers, "X-Source": "mixed"}, media_type=ctype_val)
 
-    # ── Path D pre-check: startup grace — wait for downloader to land first chunk ──
-    # Stremio fires 4-6 parallel range requests on startup before any data is local.
-    # Wait up to 5s for the first local bytes so they all hit Path A/C instead of live.
-    if task and not task.is_done():
-        grace_deadline = time.time() + 5.0
-        while time.time() < grace_deadline:
-            dm = download_manager.get_map(movie_id)
-            df = download_manager.get_file(movie_id)
-            if dm and df and df.exists() and dm.covered_prefix(start) >= MIN_LOCAL_PREFETCH:
-                break
-            try:
-                await asyncio.wait_for(asyncio.shield(task.progress_event().wait()), timeout=0.3)
-            except asyncio.TimeoutError:
-                pass
-        # Re-check Path A after grace
-        dm2 = download_manager.get_map(movie_id)
-        df2 = download_manager.get_file(movie_id)
-        if dm2 and df2 and df2.exists():
-            covered2 = dm2.covered_prefix(start)
-            if covered2 >= total:
-                return StreamingResponse(
-                    _yield_local_file(df2, start, total, request),
-                    status_code=206,
-                    headers={**headers, "X-Source": "local-grace"},
-                    media_type=ctype_val,
-                )
-            if covered2 >= MIN_LOCAL_PREFETCH:
-                rest_start = start + covered2
-                async def _mixed_grace():
-                    async for chunk in _yield_local_file(df2, start, covered2, request):
-                        yield chunk
-                    async with stream_sem:
-                        try: msg2 = await _fetch_msg(movie["message_id"])
-                        except: return
-                        al2 = (rest_start // TG_CHUNK) * TG_CHUNK
-                        fc2 = rest_start - al2
-                        lc2 = (end % TG_CHUNK) + 1
-                        pt2 = math.ceil((end+1)/TG_CHUNK) - (al2//TG_CHUNK)
-                        async for chunk in byte_streamer.yield_file(msg2, al2, fc2, lc2, pt2):
-                            if await request.is_disconnected(): break
-                            yield chunk
-                return StreamingResponse(_mixed_grace(), status_code=206,
-                                         headers={**headers, "X-Source": "mixed-grace"}, media_type=ctype_val)
-
     # ── Path D: fully live Telegram ───────────────────────────────────────────
+    # Background downloader is anchoring to play-head; stream live now,
+    # next request for this range will hit Path A once batch lands.
     try:
         msg = await _fetch_msg(movie["message_id"])
     except FloodWait as e:
@@ -709,10 +649,11 @@ async def proxy(movie_id: str, request: Request):
     parts     = math.ceil((end+1)/TG_CHUNK) - (aligned//TG_CHUNK)
 
     async def _live():
-        async with stream_sem:
-            async for chunk in byte_streamer.yield_file(msg, aligned, first_cut, last_cut, parts):
-                if await request.is_disconnected(): break
-                yield chunk
+        # No semaphore here — live proxy requests must never queue behind each other.
+        # Pyrogram handles MTProto-level concurrency internally.
+        async for chunk in byte_streamer.yield_file(msg, aligned, first_cut, last_cut, parts):
+            if await request.is_disconnected(): break
+            yield chunk
 
     return StreamingResponse(_live(), status_code=206,
                              headers={**headers, "X-Source": "telegram-live"}, media_type=ctype_val)
