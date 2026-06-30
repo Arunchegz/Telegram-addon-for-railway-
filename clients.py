@@ -44,7 +44,7 @@ class ClientPool:
                 sessions.append(s)
         return sessions
 
-    async def start(self, api_id: int, api_hash: str):
+    async def start(self, api_id: int, api_hash: str, channel_username: str | int = None):
         sessions = self._load_sessions()
         if not sessions:
             raise RuntimeError(
@@ -57,11 +57,18 @@ class ClientPool:
                 session_string=sess, no_updates=True, workers=16,
             )
             await c.start()
-            try:
-                async for _ in c.get_dialogs(limit=100):
-                    pass
-            except Exception as e:
-                print(f"[clients] peer-cache warmup failed for client {i}: {e}")
+            if channel_username:
+                try:
+                    await c.get_chat(channel_username)
+                    print(f"[clients] client {i} successfully resolved channel {channel_username}")
+                except Exception as e:
+                    print(f"[clients] client {i} failed to resolve channel {channel_username}: {e}")
+            else:
+                try:
+                    async for _ in c.get_dialogs(limit=100):
+                        pass
+                except Exception as e:
+                    print(f"[clients] peer-cache warmup failed for client {i}: {e}")
             self.clients.append(c)
             print(f"[clients] client {i} started")
         print(f"[clients] pool ready with {len(self.clients)} client(s)")

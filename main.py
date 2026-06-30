@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=False)
     stream_sem   = asyncio.Semaphore(STREAM_CONCURRENCY)
 
-    await client_pool.start(API_ID, API_HASH)
+    await client_pool.start(API_ID, API_HASH, CHANNEL_USERNAME)
     tg = client_pool.primary()  # back-compat: used for cheap get_messages calls
     byte_streamer = ByteStreamer(client_pool)
     download_manager.init_pool_size()
