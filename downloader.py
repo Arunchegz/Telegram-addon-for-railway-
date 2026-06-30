@@ -25,6 +25,8 @@ from typing import Optional
 
 import redis.asyncio as aioredis
 
+from clients import pool as client_pool
+
 # ── Constants ───────────────────────────────────────────────────────────[...]
 TG_CHUNK       = 1024 * 1024          # 1 MB per MTProto GetFile call (matches streamer.py)
 LOCAL_READY_MB = int(os.getenv("LOCAL_READY_MB", "5"))  # Switch to local when 5MB ahead cached (reduced from 50MB)
@@ -408,8 +410,18 @@ class DownloadManager:
         self._maps:  dict[str, DownloadMap]  = {}
         self._files: dict[str, SparseFile]   = {}
         self._lock   = asyncio.Lock()
-        self._dl_semaphore = asyncio.Semaphore(1)  # STRICT: only 1 concurrent download to prevent rate limits
-        self._current_movie_id: Optional[str] = None  # Track which movie is actively downloading
+        # Sized to client pool — each session has its own throttle/cooldown
+        # bucket in streamer.py, so we can safely run one download per
+        # client concurrently instead of serialising everything through 1.
+        self._dl_semaphore = asyncio.Semaphore(1)  # placeholder, resized in init_pool_size()
+        self._active_movie_ids: set[str] = set()   # movies with a live DownloadTask
+
+    def init_pool_size(self):
+        """Call once after client_pool.start() so the semaphore reflects
+        the real number of sessions. Safe to call multiple times."""
+        n = max(1, len(client_pool))
+        self._dl_semaphore = asyncio.Semaphore(n)
+        print(f"[dm] download semaphore sized to {n} (matches client pool)")
 
     async def get_or_create(
         self,
@@ -447,18 +459,10 @@ class DownloadManager:
                     return None
             # ─────────────────────────────────────────────────────────────────
 
-            # If another movie is actively downloading, don't start a new one
-            # This prevents multiple concurrent downloads that trigger rate limits
-            if self._current_movie_id and self._current_movie_id != movie_id:
-                active_task = self._tasks.get(self._current_movie_id)
-                if active_task and active_task._task and not active_task._task.done():
-                    print(f"[dl:{movie_id}] cancelling {self._current_movie_id} — switching movie")
-                    active_task.cancel()
-                    # Wait briefly for cancellation to complete
-                    try:
-                        await asyncio.wait_for(asyncio.shield(active_task._task), timeout=1.0)
-                    except (asyncio.CancelledError, asyncio.TimeoutError):
-                        pass
+            # No hard "only one movie at a time" cap anymore. Multiple
+            # DownloadTasks can run concurrently — actual concurrent
+            # Telegram chunk fetches are still bounded by self._dl_semaphore
+            # (sized to client pool count) inside DownloadTask._run.
 
             # Restore map from Redis if exists (crash recovery)
             dl_map = await self._load_map(movie_id, redis)
@@ -488,7 +492,8 @@ class DownloadManager:
             )
             dt.start()
             self._tasks[movie_id] = dt
-            self._current_movie_id = movie_id  # Track active download
+            self._active_movie_ids.add(movie_id)
+            dt._task.add_done_callback(lambda _t, mid=movie_id: self._active_movie_ids.discard(mid))
 
             # Update access timestamp for LRU eviction
             await redis.set(R_DL_TS.format(movie_id), str(time.time()), ex=86400)

@@ -34,6 +34,7 @@ from pyrogram.errors import FloodWait
 
 import pyrogram.utils
 import state as st
+from clients import pool as client_pool
 from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES
 from streamer import ByteStreamer, TG_CHUNK
 from metrics import metrics
@@ -104,30 +105,17 @@ async def lifespan(app: FastAPI):
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     redis_client = aioredis.from_url(REDIS_URL, decode_responses=False)
     stream_sem   = asyncio.Semaphore(STREAM_CONCURRENCY)
-    tg = Client("streamer", api_id=API_ID, api_hash=API_HASH,
-                session_string=SESSION_STRING, no_updates=True, workers=16)
-    await tg.start()
-    byte_streamer = ByteStreamer(tg)
-    print("Pyrogram started")
-    
-    # Warm up peer cache from dialogs (essential for private channels with 64-bit IDs)
-    try:
-        print("Warming up peer cache from dialogs...")
-        async for _ in tg.get_dialogs(limit=100):
-            pass
-        print("Peer cache warmed up")
-    except Exception as e:
-        print(f"[lifespan] warning: failed to warm up peer cache: {e}")
-        
+
+    await client_pool.start(API_ID, API_HASH)
+    tg = client_pool.primary()  # back-compat: used for cheap get_messages calls
+    byte_streamer = ByteStreamer(client_pool)
+    download_manager.init_pool_size()
+    print(f"Pyrogram pool started ({len(client_pool)} client(s))")
+
     _schedule(_sync_loop())
     yield
     await download_manager.shutdown()
-    for s in list(getattr(tg, "media_sessions", {}).values()):
-        try: await s.stop()
-        except: pass
-    if hasattr(tg, "media_sessions"):
-        tg.media_sessions.clear()
-    await tg.stop()
+    await client_pool.stop()
     await redis_client.aclose()
 
 
