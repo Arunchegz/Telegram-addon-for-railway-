@@ -1,1 +1,4 @@
-(streamer.py is a source file, so no need to add anything to .gitignore)
+```
+__pycache__/
+*.pyc
+```

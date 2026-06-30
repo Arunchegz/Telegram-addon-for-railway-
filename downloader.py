@@ -26,8 +26,8 @@ from typing import Optional
 import redis.asyncio as aioredis
 
 # ── Constants ───────────────────────────────────────────────────────────[...]
-TG_CHUNK       = 1024 * 1024          # 1 MB per MTProto GetFile call
-LOCAL_READY_MB = int(os.getenv("LOCAL_READY_MB", "50"))  # Switch to local when this many MB ahead cached
+TG_CHUNK       = 256 * 1024           # 256 KB per MTProto GetFile call (matches streamer.py)
+LOCAL_READY_MB = int(os.getenv("LOCAL_READY_MB", "5"))  # Switch to local when 5MB ahead cached (reduced from 50MB)
 STORAGE_DIR    = Path(os.getenv("STORAGE_DIR", "/tmp/tgstream"))
 MAX_LOCAL_GB   = float(os.getenv("MAX_LOCAL_GB", "10"))  # evict LRU beyond this
 DL_MIN_BACKOFF = float(os.getenv("DL_MIN_BACKOFF", "2"))  # Backoff on error (seconds)

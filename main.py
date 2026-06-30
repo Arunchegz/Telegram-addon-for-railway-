@@ -70,8 +70,8 @@ REDIS_URL          = os.getenv("REDIS_URL", "")
 SYNC_INTERVAL      = int(os.getenv("SYNC_INTERVAL", "300"))
 STREAM_CONCURRENCY = int(os.getenv("STREAM_CONCURRENCY", "3"))  # live proxy streams; keep low to avoid MTProto congestion
 WAIT_TIMEOUT_S     = float(os.getenv("WAIT_TIMEOUT_S", "1.0"))  # Reduced from 2.0s for aggressive Path C
-STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "1"))  # Reduced from 4 MB to 1 MB
-LOCAL_READ_CHUNK   = int(os.getenv("LOCAL_READ_CHUNK", str(1024 * 1024)))
+STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "2"))  # 2 chunks × 256KB = 512KB initial fetch
+LOCAL_READ_CHUNK   = int(os.getenv("LOCAL_READ_CHUNK", str(256 * 1024)))  # Match TG_CHUNK for consistency
 # LOCAL_READY_BYTES imported from downloader (default 50MB)
 
 tg: Client = None
