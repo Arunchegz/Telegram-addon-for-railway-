@@ -259,11 +259,11 @@ class DownloadTask:
             self._task.cancel()
 
     # ── Internal ─────────────────────────────────────────────────────────[...]
-    async def _fresh_msg(self):
+    async def _fresh_msg(self, c: Client):
         """Re-fetch message if file_reference may have expired (>50min old)."""
         now = time.time()
         if self._msg is None or (now - self._msg_fetched_at) > 3000:
-            self._msg = await self.fetch_msg(self.message_id)
+            self._msg = await self.fetch_msg(self.message_id, client=c)
             self._msg_fetched_at = now
         return self._msg
 
@@ -277,7 +277,12 @@ class DownloadTask:
           - Never waits for 90% triggers or batch boundaries.
           - Proxy switches to local once LOCAL_READY_BYTES ahead of hint is cached.
         """
-        print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB")
+        if hasattr(self.streamer.client, "pick"):
+            c_idx, c = await self.streamer.client.pick()
+        else:
+            c_idx, c = None, self.streamer.client
+
+        print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB using client {c_idx if c_idx is not None else 0}")
         try:
             from metrics import metrics
             metrics.downloads_active += 1
@@ -307,7 +312,7 @@ class DownloadTask:
                 chunk_len = chunk_end - current_offset + 1
 
                 try:
-                    msg  = await self._fresh_msg()
+                    msg  = await self._fresh_msg(c)
                     data = bytearray()
                     async with self._semaphore:
                         async for piece in self.streamer.yield_file(
@@ -317,6 +322,8 @@ class DownloadTask:
                             last_cut=chunk_len,
                             parts=1,
                             chunk=TG_CHUNK,
+                            c=c,
+                            c_idx=c_idx,
                         ):
                             data.extend(piece)
 

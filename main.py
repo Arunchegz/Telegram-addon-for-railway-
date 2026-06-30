@@ -126,8 +126,9 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 app.mount("/dashboard", StaticFiles(directory="static", html=True), name="dashboard")
 
 
-async def _fetch_msg(msg_id: int):
-    return await tg.get_messages(CHANNEL_USERNAME, msg_id)
+async def _fetch_msg(msg_id: int, client: Client = None):
+    c = client or tg
+    return await c.get_messages(CHANNEL_USERNAME, msg_id)
 
 
 async def _sync_loop():

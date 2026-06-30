@@ -70,12 +70,15 @@ class ByteStreamer:
         parts: int,
         chunk: int = TG_CHUNK,
         _retry: bool = True,
+        c: Client = None,
+        c_idx: int = None,
     ) -> AsyncGenerator[bytes, None]:
         fid     = _extract_fid(msg)
-        if hasattr(self.client, "pick"):
-            c_idx, c = await self.client.pick()
-        else:
-            c_idx, c = None, self.client
+        if c is None:
+            if hasattr(self.client, "pick"):
+                c_idx, c = await self.client.pick()
+            else:
+                c_idx, c = None, self.client
         session = await self._session(c, fid)
         loc     = _location(fid)
         part    = 1
@@ -104,7 +107,7 @@ class ByteStreamer:
                     await self._wait_backoff(dc_id, e.value)
                     # Retry after backoff
                     if _retry:
-                        async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False):
+                        async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False, c, c_idx):
                             yield b
                         return
                     else:
@@ -112,9 +115,8 @@ class ByteStreamer:
         except FileReferenceExpired:
             if not _retry:
                 raise
-            target_client = self.client.primary() if hasattr(self.client, "primary") else c
-            msg = await target_client.get_messages(msg.chat.id, msg.id)
-            async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False):
+            msg = await c.get_messages(msg.chat.id, msg.id)
+            async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False, c, c_idx):
                 yield b
             return
 
@@ -151,7 +153,7 @@ class ByteStreamer:
                 await self._wait_backoff(dc_id, e.value)
                 # Retry after backoff
                 if _retry:
-                    async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False):
+                    async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False, c, c_idx):
                         yield b
                     return
                 else:
@@ -159,9 +161,8 @@ class ByteStreamer:
             except FileReferenceExpired:
                 if not _retry:
                     raise
-                target_client = self.client.primary() if hasattr(self.client, "primary") else c
-                msg = await target_client.get_messages(msg.chat.id, msg.id)
-                async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False):
+                msg = await c.get_messages(msg.chat.id, msg.id)
+                async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False, c, c_idx):
                     yield b
                 return
 
