@@ -72,7 +72,7 @@ STREAM_CONCURRENCY = int(os.getenv("STREAM_CONCURRENCY", "3"))  # live proxy str
 WAIT_TIMEOUT_S     = float(os.getenv("WAIT_TIMEOUT_S", "1.0"))  # Reduced from 2.0s for aggressive Path C
 STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "1"))  # Reduced from 4 MB to 1 MB
 LOCAL_READ_CHUNK   = int(os.getenv("LOCAL_READ_CHUNK", str(1024 * 1024)))
-# MIN_LOCAL_PREFETCH replaced by LOCAL_READY_BYTES from downloader (default 50MB)
+# LOCAL_READY_BYTES imported from downloader (default 50MB)
 
 tg: Client = None
 redis_client: aioredis.Redis = None
@@ -606,10 +606,10 @@ async def proxy(movie_id: str, request: Request):
 
     # ── Path C: local prefix + live tail ────────────────────────────────────────
     # (Path B removed: live-first strategy means waiting is always wrong)
-    # Trigger on ANY available local data (>= MIN_LOCAL_PREFETCH), not just substantial coverage
+    # Switch to local once LOCAL_READY_BYTES ahead of start is cached.
     if dl_map and dl_file and dl_file.exists():
         covered = dl_map.covered_prefix(start)
-        if covered >= MIN_LOCAL_PREFETCH and covered < total:
+        if covered >= LOCAL_READY_BYTES and covered < total:
             rest_start = start + covered
 
             async def _mixed():
