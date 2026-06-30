@@ -19,10 +19,10 @@ from pyrogram.errors import AuthBytesInvalid, FileReferenceExpired, FloodWait
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
 from pyrogram.session import Auth, Session
 
-TG_CHUNK = 1024 * 1024
-MIN_THROTTLE_MS = 250  # 250ms between GetFile calls (~4 req/s); increased from 100ms to reduce rate limits
+TG_CHUNK = 256 * 1024  # 256KB chunks - matches typical HTTP Range requests, reduces API call frequency
+MIN_THROTTLE_MS = 500  # 500ms between GetFile calls (~2 req/s); conservative to avoid rate limits
 MAX_BACKOFF_S = 60     # Max backoff on rate limit (Telegram's max is typically 2-60s)
-MAX_CONCURRENT_GETFILE = 3  # Limit concurrent GetFile operations across all streams
+MAX_CONCURRENT_GETFILE = 1  # Single concurrent GetFile to prevent request storms
 
 
 class ByteStreamer:
