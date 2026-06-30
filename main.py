@@ -36,6 +36,7 @@ import pyrogram.utils
 import state as st
 from downloader import DownloadMap, download_manager, STORAGE_DIR, LOCAL_READY_BYTES
 from streamer import ByteStreamer, TG_CHUNK
+from metrics import metrics
 
 # Monkey-patch Pyrogram to support newer 64-bit channel/chat IDs (> 32-bit suffixes)
 def get_peer_type_patched(peer_id: int) -> str:
@@ -524,6 +525,8 @@ async def proxy(movie_id: str, request: Request):
       D. Fully live Telegram MTProto       -> StreamingResponse fallback
     X-Source header reveals which path was used (visible in dev tools).
     """
+    await metrics.record_proxy_request()
+
     movies = await st.load_movies(redis_client)
     movie  = movies.get(movie_id)
     if not movie: raise HTTPException(404, "Not found")
@@ -572,16 +575,9 @@ async def proxy(movie_id: str, request: Request):
                 if len(p) > 1 and p[1]: end = int(p[1])
         except:
             return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
-    if not rh:
-        end = min(STARTUP_CHUNKS * TG_CHUNK - 1, file_size - 1)
-    elif rh.endswith("-"):
-        end = min(start + STARTUP_CHUNKS * TG_CHUNK - 1, file_size - 1)
-    else:
-        end = min(end, file_size - 1)
-    if start < 0 or start >= file_size or end < start:
-        return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
 
-    total = end - start + 1
+    req_start = start
+    req_end = end
 
     # Hint downloader — but ignore suffix-range probes (bytes=-N) and tiny
     # metadata reads near EOF; these are container/moov-atom probes, not
@@ -589,6 +585,35 @@ async def proxy(movie_id: str, request: Request):
     task    = download_manager.get(movie_id)
     dl_map  = download_manager.get_map(movie_id)
     dl_file = download_manager.get_file(movie_id)
+
+    # Check cache status
+    covered = dl_map.covered_prefix(req_start) if (dl_map and dl_file and dl_file.exists()) else 0
+
+    # Path selection and capping
+    use_path = None
+    if covered > 0 and (req_start + covered - 1) >= req_end:
+        # Path A: Range fully in local SparseFile
+        use_path = "local"
+        end = req_end
+    elif covered >= LOCAL_READY_BYTES:
+        # Path C: Mixed local prefix + live Telegram tail
+        use_path = "mixed"
+        end = req_end
+    else:
+        # Path D: Telegram live fallback. Cap open-ended requests to avoid rate limits/over-streaming.
+        use_path = "telegram-live"
+        if not rh:
+            end = min(req_start + STARTUP_CHUNKS * TG_CHUNK - 1, req_end)
+        elif rh.endswith("-"):
+            end = min(req_start + STARTUP_CHUNKS * TG_CHUNK - 1, req_end)
+        else:
+            end = min(req_end, file_size - 1)
+
+    if start < 0 or start >= file_size or end < start:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+
+    total = end - start + 1
+
     _is_suffix_probe = rh.startswith("bytes=-")
     _is_tail_probe   = total <= 2 * 1024 * 1024 and start > file_size - (10 * 1024 * 1024)
     if task and not _is_suffix_probe and not _is_tail_probe:
@@ -601,7 +626,9 @@ async def proxy(movie_id: str, request: Request):
     }
 
     # ── Path A: fully local ───────────────────────────────────────────────────
-    if dl_map and dl_file and dl_file.exists() and dl_map.has_range(start, end):
+    if use_path == "local":
+        await metrics.record_stream_path("local")
+        await metrics.record_cache_hit(total)
         return StreamingResponse(
             _yield_local_file(dl_file, start, total, request),
             status_code=206,
@@ -610,33 +637,34 @@ async def proxy(movie_id: str, request: Request):
         )
 
     # ── Path C: local prefix + live tail ────────────────────────────────────────
-    # (Path B removed: live-first strategy means waiting is always wrong)
-    # Switch to local once LOCAL_READY_BYTES ahead of start is cached.
-    if dl_map and dl_file and dl_file.exists():
-        covered = dl_map.covered_prefix(start)
-        if covered >= LOCAL_READY_BYTES and covered < total:
-            rest_start = start + covered
+    if use_path == "mixed":
+        await metrics.record_stream_path("mixed")
+        await metrics.record_cache_hit(covered)
+        await metrics.record_cache_miss(total - covered)
 
-            async def _mixed():
-                async for chunk in _yield_local_file(dl_file, start, covered, request):
+        rest_start = start + covered
+
+        async def _mixed():
+            async for chunk in _yield_local_file(dl_file, start, covered, request):
+                yield chunk
+            async with stream_sem:
+                try: msg = await _fetch_msg(movie["message_id"])
+                except: return
+                aligned   = (rest_start // TG_CHUNK) * TG_CHUNK
+                first_cut = rest_start - aligned
+                last_cut  = (end % TG_CHUNK) + 1
+                parts     = math.ceil((end+1)/TG_CHUNK) - (aligned//TG_CHUNK)
+                async for chunk in byte_streamer.yield_file(msg, aligned, first_cut, last_cut, parts):
+                    if await request.is_disconnected(): break
                     yield chunk
-                async with stream_sem:
-                    try: msg = await _fetch_msg(movie["message_id"])
-                    except: return
-                    aligned   = (rest_start // TG_CHUNK) * TG_CHUNK
-                    first_cut = rest_start - aligned
-                    last_cut  = (end % TG_CHUNK) + 1
-                    parts     = math.ceil((end+1)/TG_CHUNK) - (aligned//TG_CHUNK)
-                    async for chunk in byte_streamer.yield_file(msg, aligned, first_cut, last_cut, parts):
-                        if await request.is_disconnected(): break
-                        yield chunk
 
-            return StreamingResponse(_mixed(), status_code=206,
-                                     headers={**headers, "X-Source": "mixed"}, media_type=ctype_val)
+        return StreamingResponse(_mixed(), status_code=206,
+                                 headers={**headers, "X-Source": "mixed"}, media_type=ctype_val)
 
     # ── Path D: fully live Telegram ───────────────────────────────────────────
-    # Background downloader is anchoring to play-head; stream live now,
-    # next request for this range will hit Path A once batch lands.
+    await metrics.record_stream_path("telegram-live")
+    await metrics.record_cache_miss(total)
+
     try:
         msg = await _fetch_msg(movie["message_id"])
     except FloodWait as e:
@@ -732,3 +760,111 @@ async def api_config():
         "manifest_url": manifest_url,
         "stremio_url": stremio_url
     }
+
+
+# ── Monitoring Endpoints ─────────────────────────────────────────────────────
+@app.get("/api/metrics")
+async def get_metrics():
+    """Get comprehensive metrics snapshot."""
+    return metrics.get_stats()
+
+
+@app.get("/api/metrics/rate-limits")
+async def get_rate_limits():
+    """Get detailed rate limit analytics."""
+    now = time.time()
+    hour_ago = now - 3600
+    day_ago = now - 86400
+    
+    recent_hour = [e for e in metrics.rate_limit_events if e[0] > hour_ago]
+    recent_day = [e for e in metrics.rate_limit_events if e[0] > day_ago]
+    
+    # Group by DC
+    dc_stats = {}
+    for ts, dc_id, wait_s in recent_day:
+        if dc_id not in dc_stats:
+            dc_stats[dc_id] = {"count": 0, "total_wait": 0, "max_wait": 0}
+        dc_stats[dc_id]["count"] += 1
+        dc_stats[dc_id]["total_wait"] += wait_s
+        dc_stats[dc_id]["max_wait"] = max(dc_stats[dc_id]["max_wait"], wait_s)
+    
+    return {
+        "hour": {
+            "events": len(recent_hour),
+            "total_wait_s": round(sum(e[2] for e in recent_hour), 1),
+        },
+        "day": {
+            "events": len(recent_day),
+            "total_wait_s": round(sum(e[2] for e in recent_day), 1),
+            "avg_wait_s": round(sum(e[2] for e in recent_day) / max(1, len(recent_day)), 1),
+        },
+        "by_datacenter": {str(dc): stats for dc, stats in dc_stats.items()},
+    }
+
+
+@app.get("/api/metrics/cache")
+async def get_cache_metrics():
+    """Get cache performance metrics."""
+    stats = metrics.get_stats()
+    cache_stats = stats["cache"]
+    total_requests = cache_stats["hits"] + cache_stats["misses"]
+    
+    # Estimate bandwidth saved
+    bandwidth_saved_mb = cache_stats["bytes_cached"] / 1024 / 1024
+    
+    return {
+        **cache_stats,
+        "total_requests": total_requests,
+        "bandwidth_saved_mb": round(bandwidth_saved_mb, 1),
+        "avg_hit_size_kb": round(cache_stats["bytes_cached"] / max(1, cache_stats["hits"]) / 1024, 1),
+    }
+
+
+@app.get("/api/metrics/streaming")
+async def get_streaming_metrics():
+    """Get streaming path statistics."""
+    stats = metrics.get_stats()
+    return stats["streaming"]
+
+
+@app.get("/api/metrics/health")
+async def get_health_metrics():
+    """Get system health indicators."""
+    stats = metrics.get_stats()
+    dl_stats = download_manager.stats()
+    
+    return {
+        "http": stats["http"],
+        "downloads": stats["downloads"],
+        "rate_limit_pressure": {
+            "events_per_hour": stats["rate_limits"]["recent_hour"],
+            "avg_backoff_s": stats["rate_limits"]["avg_wait_s"],
+        },
+        "active_tasks": len(dl_stats),
+        "memory_usage_estimate_mb": sum(
+            s.get("size_on_disk_mb", 0) for s in dl_stats.values()
+        ),
+    }
+
+
+@app.get("/api/metrics/export")
+async def export_metrics():
+    """Export metrics in Prometheus format."""
+    stats = metrics.get_stats()
+    lines = [
+        "# HELP tgstream_rate_limit_events_total Total rate limit events",
+        f"tgstream_rate_limit_events_total {stats['rate_limits']['total_events']}",
+        "# HELP tgstream_rate_limit_wait_seconds Total time spent in rate limit backoff",
+        f"tgstream_rate_limit_wait_seconds {stats['rate_limits']['total_wait_s']}",
+        "# HELP tgstream_cache_hits_total Successful cache reads",
+        f"tgstream_cache_hits_total {stats['cache']['hits']}",
+        "# HELP tgstream_cache_misses_total Cache misses (fetched from Telegram)",
+        f"tgstream_cache_misses_total {stats['cache']['misses']}",
+        "# HELP tgstream_http_requests_total Total HTTP requests",
+        f"tgstream_http_requests_total {stats['http']['total_requests']}",
+        "# HELP tgstream_http_errors_total HTTP errors",
+        f"tgstream_http_errors_total {stats['http']['errors']}",
+        "# HELP tgstream_downloads_active Active download tasks",
+        f"tgstream_downloads_active {stats['downloads']['active']}",
+    ]
+    return Response(content="\n".join(lines), media_type="text/plain")

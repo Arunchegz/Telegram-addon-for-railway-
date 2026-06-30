@@ -275,69 +275,92 @@ class DownloadTask:
           - Proxy switches to local once LOCAL_READY_BYTES ahead of hint is cached.
         """
         print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB")
+        try:
+            from metrics import metrics
+            metrics.downloads_active += 1
+        except Exception:
+            pass
 
-        current_offset = (self._hint // TG_CHUNK) * TG_CHUNK
+        try:
+            current_offset = (self._hint // TG_CHUNK) * TG_CHUNK
 
-        while current_offset < self.file_size:
-            # Re-anchor if seek jumped ahead
-            if self._seek_event.is_set():
-                self._seek_event.clear()
-                current_offset = (self._hint // TG_CHUNK) * TG_CHUNK
-                print(f"[dl:{self.movie_id}] seek → re-anchor at {current_offset/1024/1024:.1f}MB")
-                # Grace delay: let the live proxy stream claim the MTProto session
-                # first after a seek, instead of both proxy and downloader hitting
-                # GetFile simultaneously and triggering FloodWait.
-                await asyncio.sleep(SEEK_GRACE_DELAY_S)
+            while current_offset < self.file_size:
+                # Re-anchor if seek jumped ahead
+                if self._seek_event.is_set():
+                    self._seek_event.clear()
+                    current_offset = (self._hint // TG_CHUNK) * TG_CHUNK
+                    print(f"[dl:{self.movie_id}] seek → re-anchor at {current_offset/1024/1024:.1f}MB")
+                    # Grace delay: let the live proxy stream claim the MTProto session
+                    # first after a seek, instead of both proxy and downloader hitting
+                    # GetFile simultaneously and triggering FloodWait.
+                    await asyncio.sleep(SEEK_GRACE_DELAY_S)
 
-            # Skip already-cached chunk
-            chunk_end = min(current_offset + TG_CHUNK - 1, self.file_size - 1)
-            if self.dl_map.has_range(current_offset, chunk_end):
+                # Skip already-cached chunk
+                chunk_end = min(current_offset + TG_CHUNK - 1, self.file_size - 1)
+                if self.dl_map.has_range(current_offset, chunk_end):
+                    current_offset = chunk_end + 1
+                    continue
+
+                chunk_len = chunk_end - current_offset + 1
+
+                try:
+                    msg  = await self._fresh_msg()
+                    data = bytearray()
+                    async with self._semaphore:
+                        async for piece in self.streamer.yield_file(
+                            msg,
+                            offset=current_offset,
+                            first_cut=0,
+                            last_cut=chunk_len,
+                            parts=1,
+                            chunk=TG_CHUNK,
+                        ):
+                            data.extend(piece)
+
+                    if not data:
+                        raise Exception("No data from Telegram")
+
+                    await self.sparse.pwrite(bytes(data), current_offset)
+                    self.dl_map.add(current_offset, current_offset + len(data) - 1)
+                    await self._persist_map()
+                    self._progress_event.set()
+                    self._progress_event = asyncio.Event()
+                    self._error_backoff = 1.0
+
+                    try:
+                        from metrics import metrics
+                        metrics.total_downloaded_mb += len(data) / 1024 / 1024
+                    except Exception:
+                        pass
+
+                except asyncio.CancelledError:
+                    print(f"[dl:{self.movie_id}] cancelled at {current_offset/1024/1024:.1f}MB")
+                    return
+                except Exception as e:
+                    backoff_s = DL_MIN_BACKOFF * self._error_backoff
+                    self._error_backoff = min(self._error_backoff * 2, 8)
+                    print(f"[dl:{self.movie_id}] error at {current_offset/1024/1024:.1f}MB: {e}, backoff {backoff_s:.1f}s")
+                    await asyncio.sleep(backoff_s)
+                    self._msg = None
+                    continue
+
                 current_offset = chunk_end + 1
-                continue
 
-            chunk_len = chunk_end - current_offset + 1
-
+            # EOF
+            self._done = True
+            await self.redis.set(R_DL_DONE.format(self.movie_id), "1")
+            print(f"[dl:{self.movie_id}] complete {self.dl_map.total_bytes()/1024/1024:.1f}MB cached")
             try:
-                msg  = await self._fresh_msg()
-                data = bytearray()
-                async with self._semaphore:
-                    async for piece in self.streamer.yield_file(
-                        msg,
-                        offset=current_offset,
-                        first_cut=0,
-                        last_cut=chunk_len,
-                        parts=1,
-                        chunk=TG_CHUNK,
-                    ):
-                        data.extend(piece)
-
-                if not data:
-                    raise Exception("No data from Telegram")
-
-                await self.sparse.pwrite(bytes(data), current_offset)
-                self.dl_map.add(current_offset, current_offset + len(data) - 1)
-                await self._persist_map()
-                self._progress_event.set()
-                self._progress_event = asyncio.Event()
-                self._error_backoff = 1.0
-
-            except asyncio.CancelledError:
-                print(f"[dl:{self.movie_id}] cancelled at {current_offset/1024/1024:.1f}MB")
-                return
-            except Exception as e:
-                backoff_s = DL_MIN_BACKOFF * self._error_backoff
-                self._error_backoff = min(self._error_backoff * 2, 8)
-                print(f"[dl:{self.movie_id}] error at {current_offset/1024/1024:.1f}MB: {e}, backoff {backoff_s:.1f}s")
-                await asyncio.sleep(backoff_s)
-                self._msg = None
-                continue
-
-            current_offset = chunk_end + 1
-
-        # EOF
-        self._done = True
-        await self.redis.set(R_DL_DONE.format(self.movie_id), "1")
-        print(f"[dl:{self.movie_id}] complete {self.dl_map.total_bytes()/1024/1024:.1f}MB cached")
+                from metrics import metrics
+                metrics.downloads_completed += 1
+            except Exception:
+                pass
+        finally:
+            try:
+                from metrics import metrics
+                metrics.downloads_active = max(0, metrics.downloads_active - 1)
+            except Exception:
+                pass
 
 
     def _find_next_gap(self, from_offset: int) -> int:

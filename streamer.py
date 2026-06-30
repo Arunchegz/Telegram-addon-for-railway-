@@ -30,6 +30,7 @@ class ByteStreamer:
         self.client = client
         self._last_invoke_time = 0.0
         self._throttle_lock = asyncio.Lock()  # Serialize throttle across concurrent streams
+        self._session_lock = asyncio.Lock()   # Lock to serialize session creation
         self._backoff_until = {}  # Per-DC backoff state: {dc_id: until_timestamp}
         self._concurrent_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GETFILE)  # Global concurrency limit
 
@@ -53,6 +54,11 @@ class ByteStreamer:
         until = time.time() + wait_s
         self._backoff_until[dc_id] = until
         print(f"[streamer] DC {dc_id} rate limited. Backoff {wait_s:.1f}s (Telegram req: {flood_wait_s}s)")
+        try:
+            from metrics import metrics
+            await metrics.record_rate_limit(dc_id, wait_s)
+        except Exception as e:
+            print(f"[streamer] metrics error: {e}")
         await asyncio.sleep(wait_s)
 
     async def yield_file(
@@ -157,37 +163,42 @@ class ByteStreamer:
         if dc in c.media_sessions:
             return c.media_sessions[dc]
 
-        if dc != await c.storage.dc_id():
-            s = Session(
-                c, dc,
-                await Auth(c, dc, await c.storage.test_mode()).create(),
-                await c.storage.test_mode(),
-                is_media=True,
-            )
-            await s.start()
-            for _ in range(6):
-                exp = await c.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc))
-                try:
-                    await s.invoke(
-                        raw.functions.auth.ImportAuthorization(id=exp.id, bytes=exp.bytes)
-                    )
-                    break
-                except AuthBytesInvalid:
-                    continue
-            else:
-                await s.stop()
-                raise AuthBytesInvalid
-        else:
-            s = Session(
-                c, dc,
-                await c.storage.auth_key(),
-                await c.storage.test_mode(),
-                is_media=True,
-            )
-            await s.start()
+        async with self._session_lock:
+            # Double check inside lock
+            if dc in c.media_sessions:
+                return c.media_sessions[dc]
 
-        c.media_sessions[dc] = s
-        return s
+            if dc != await c.storage.dc_id():
+                s = Session(
+                    c, dc,
+                    await Auth(c, dc, await c.storage.test_mode()).create(),
+                    await c.storage.test_mode(),
+                    is_media=True,
+                )
+                await s.start()
+                for _ in range(6):
+                    exp = await c.invoke(raw.functions.auth.ExportAuthorization(dc_id=dc))
+                    try:
+                        await s.invoke(
+                            raw.functions.auth.ImportAuthorization(id=exp.id, bytes=exp.bytes)
+                        )
+                        break
+                    except AuthBytesInvalid:
+                        continue
+                else:
+                    await s.stop()
+                    raise AuthBytesInvalid
+            else:
+                s = Session(
+                    c, dc,
+                    await c.storage.auth_key(),
+                    await c.storage.test_mode(),
+                    is_media=True,
+                )
+                await s.start()
+
+            c.media_sessions[dc] = s
+            return s
 
 
 def _extract_fid(msg) -> FileId:
