@@ -20,8 +20,9 @@ from pyrogram.file_id import FileId, FileType, ThumbnailSource
 from pyrogram.session import Auth, Session
 
 TG_CHUNK = 1024 * 1024
-MIN_THROTTLE_MS = 100  # 100ms between GetFile calls (~10 req/s); 50ms was too aggressive under concurrent streams
+MIN_THROTTLE_MS = 250  # 250ms between GetFile calls (~4 req/s); increased from 100ms to reduce rate limits
 MAX_BACKOFF_S = 60     # Max backoff on rate limit (Telegram's max is typically 2-60s)
+MAX_CONCURRENT_GETFILE = 3  # Limit concurrent GetFile operations across all streams
 
 
 class ByteStreamer:
@@ -30,6 +31,7 @@ class ByteStreamer:
         self._last_invoke_time = 0.0
         self._throttle_lock = asyncio.Lock()  # Serialize throttle across concurrent streams
         self._backoff_until = {}  # Per-DC backoff state: {dc_id: until_timestamp}
+        self._concurrent_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GETFILE)  # Global concurrency limit
 
     async def _throttle(self) -> None:
         """Enforce minimum inter-request delay to avoid Telegram rate limits.
@@ -80,20 +82,21 @@ class ByteStreamer:
             del self._backoff_until[dc_id]
 
         try:
-            await self._throttle()  # Apply inter-request throttle
-            try:
-                r = await session.invoke(
-                    raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
-                )
-            except FloodWait as e:
-                await self._wait_backoff(dc_id, e.value)
-                # Retry after backoff
-                if _retry:
-                    async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False):
-                        yield b
-                    return
-                else:
-                    raise
+            async with self._concurrent_semaphore:
+                await self._throttle()  # Apply inter-request throttle
+                try:
+                    r = await session.invoke(
+                        raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
+                    )
+                except FloodWait as e:
+                    await self._wait_backoff(dc_id, e.value)
+                    # Retry after backoff
+                    if _retry:
+                        async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False):
+                            yield b
+                        return
+                    else:
+                        raise
         except FileReferenceExpired:
             if not _retry:
                 raise
@@ -125,19 +128,19 @@ class ByteStreamer:
 
             await self._throttle()  # Throttle between chunks
             try:
-                try:
+                async with self._concurrent_semaphore:
                     r = await session.invoke(
                         raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
                     )
-                except FloodWait as e:
-                    await self._wait_backoff(dc_id, e.value)
-                    # Retry after backoff
-                    if _retry:
-                        async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False):
-                            yield b
-                        return
-                    else:
-                        raise
+            except FloodWait as e:
+                await self._wait_backoff(dc_id, e.value)
+                # Retry after backoff
+                if _retry:
+                    async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False):
+                        yield b
+                    return
+                else:
+                    raise
             except FileReferenceExpired:
                 if not _retry:
                     raise
