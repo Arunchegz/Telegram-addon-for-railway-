@@ -31,6 +31,7 @@ LOCAL_READY_MB = int(os.getenv("LOCAL_READY_MB", "50"))  # Switch to local when 
 STORAGE_DIR    = Path(os.getenv("STORAGE_DIR", "/tmp/tgstream"))
 MAX_LOCAL_GB   = float(os.getenv("MAX_LOCAL_GB", "10"))  # evict LRU beyond this
 DL_MIN_BACKOFF = float(os.getenv("DL_MIN_BACKOFF", "2"))  # Backoff on error (seconds)
+SEEK_GRACE_DELAY_S = float(os.getenv("SEEK_GRACE_DELAY_S", "3"))  # Pause downloader after seek, let live proxy claim MTProto first
 LOCAL_READY_BYTES = LOCAL_READY_MB * 1024 * 1024
 
 # Redis key templates
@@ -283,6 +284,10 @@ class DownloadTask:
                 self._seek_event.clear()
                 current_offset = (self._hint // TG_CHUNK) * TG_CHUNK
                 print(f"[dl:{self.movie_id}] seek → re-anchor at {current_offset/1024/1024:.1f}MB")
+                # Grace delay: let the live proxy stream claim the MTProto session
+                # first after a seek, instead of both proxy and downloader hitting
+                # GetFile simultaneously and triggering FloodWait.
+                await asyncio.sleep(SEEK_GRACE_DELAY_S)
 
             # Skip already-cached chunk
             chunk_end = min(current_offset + TG_CHUNK - 1, self.file_size - 1)
