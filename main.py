@@ -73,6 +73,7 @@ STREAM_CONCURRENCY = int(os.getenv("STREAM_CONCURRENCY", "3"))  # live proxy str
 WAIT_TIMEOUT_S     = float(os.getenv("WAIT_TIMEOUT_S", "1.0"))  # Reduced from 2.0s for aggressive Path C
 STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "2"))  # 2 chunks × 1MB = 2MB initial fetch
 LOCAL_READ_CHUNK   = int(os.getenv("LOCAL_READ_CHUNK", str(1024 * 1024)))  # Match TG_CHUNK for consistency
+SHORT_WAIT_GRACE_BYTES = int(os.getenv("SHORT_WAIT_GRACE_BYTES", str(2 * 1024 * 1024)))  # 2MB grace window for Path B
 # LOCAL_READY_BYTES imported from downloader (default 50MB)
 
 tg: Client = None
@@ -595,11 +596,22 @@ async def proxy(movie_id: str, request: Request):
         # Path A: Range fully in local SparseFile
         use_path = "local"
         end = req_end
-    elif covered >= LOCAL_READY_BYTES:
+    elif covered > 0 and (req_start + covered - 1) >= req_end - SHORT_WAIT_GRACE_BYTES:
+        # Path B: almost there, wait briefly then re-check
+        if task:
+            try:
+                await asyncio.wait_for(task.progress_event().wait(), timeout=0.3)
+            except asyncio.TimeoutError:
+                pass
+            covered = dl_map.covered_prefix(req_start)
+            if covered > 0 and (req_start + covered - 1) >= req_end:
+                use_path = "local"
+                end = req_end
+    if use_path is None and covered >= LOCAL_READY_BYTES:
         # Path C: Mixed local prefix + live Telegram tail
         use_path = "mixed"
         end = req_end
-    else:
+    if use_path is None:
         # Path D: Telegram live fallback. Cap open-ended requests to avoid rate limits/over-streaming.
         use_path = "telegram-live"
         if not rh:
