@@ -72,7 +72,11 @@ class ByteStreamer:
         _retry: bool = True,
     ) -> AsyncGenerator[bytes, None]:
         fid     = _extract_fid(msg)
-        session = await self._session(fid)
+        if hasattr(self.client, "pick"):
+            c_idx, c = await self.client.pick()
+        else:
+            c_idx, c = None, self.client
+        session = await self._session(c, fid)
         loc     = _location(fid)
         part    = 1
         off     = offset
@@ -95,6 +99,8 @@ class ByteStreamer:
                         raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
                     )
                 except FloodWait as e:
+                    if c_idx is not None and hasattr(self.client, "mark_cooldown"):
+                        self.client.mark_cooldown(c_idx, e.value)
                     await self._wait_backoff(dc_id, e.value)
                     # Retry after backoff
                     if _retry:
@@ -106,7 +112,8 @@ class ByteStreamer:
         except FileReferenceExpired:
             if not _retry:
                 raise
-            msg = await self.client.get_messages(msg.chat.id, msg.id)
+            target_client = self.client.primary() if hasattr(self.client, "primary") else c
+            msg = await target_client.get_messages(msg.chat.id, msg.id)
             async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False):
                 yield b
             return
@@ -139,6 +146,8 @@ class ByteStreamer:
                         raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
                     )
             except FloodWait as e:
+                if c_idx is not None and hasattr(self.client, "mark_cooldown"):
+                    self.client.mark_cooldown(c_idx, e.value)
                 await self._wait_backoff(dc_id, e.value)
                 # Retry after backoff
                 if _retry:
@@ -150,13 +159,13 @@ class ByteStreamer:
             except FileReferenceExpired:
                 if not _retry:
                     raise
-                msg = await self.client.get_messages(msg.chat.id, msg.id)
+                target_client = self.client.primary() if hasattr(self.client, "primary") else c
+                msg = await target_client.get_messages(msg.chat.id, msg.id)
                 async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False):
                     yield b
                 return
 
-    async def _session(self, fid: FileId) -> Session:
-        c  = self.client
+    async def _session(self, c: Client, fid: FileId) -> Session:
         dc = fid.dc_id
         if not hasattr(c, "media_sessions"):
             c.media_sessions = {}
