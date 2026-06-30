@@ -583,11 +583,16 @@ async def proxy(movie_id: str, request: Request):
 
     total = end - start + 1
 
-    # Hint downloader
+    # Hint downloader — but ignore suffix-range probes (bytes=-N) and tiny
+    # metadata reads near EOF; these are container/moov-atom probes, not
+    # real playback position, and would wrongly drag the downloader to EOF.
     task    = download_manager.get(movie_id)
     dl_map  = download_manager.get_map(movie_id)
     dl_file = download_manager.get_file(movie_id)
-    if task: task.hint(start)
+    _is_suffix_probe = rh.startswith("bytes=-")
+    _is_tail_probe   = total <= 2 * 1024 * 1024 and start > file_size - (10 * 1024 * 1024)
+    if task and not _is_suffix_probe and not _is_tail_probe:
+        task.hint(start)
 
     headers = {
         "Accept-Ranges": "bytes", "Content-Range": f"bytes {start}-{end}/{file_size}",
