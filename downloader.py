@@ -31,7 +31,8 @@ LOCAL_READY_MB = int(os.getenv("LOCAL_READY_MB", "50"))  # Switch to local when 
 STORAGE_DIR    = Path(os.getenv("STORAGE_DIR", "/tmp/tgstream"))
 MAX_LOCAL_GB   = float(os.getenv("MAX_LOCAL_GB", "10"))  # evict LRU beyond this
 DL_MIN_BACKOFF = float(os.getenv("DL_MIN_BACKOFF", "2"))  # Backoff on error (seconds)
-SEEK_GRACE_DELAY_S = float(os.getenv("SEEK_GRACE_DELAY_S", "3"))  # Pause downloader after seek, let live proxy claim MTProto first
+SEEK_GRACE_DELAY_S = float(os.getenv("SEEK_GRACE_DELAY_S", "5"))  # Pause downloader after seek, let live proxy claim MTProto first
+DL_THROTTLE_S  = float(os.getenv("DL_THROTTLE_S", "1.5"))  # Sleep between successful chunks
 LOCAL_READY_BYTES = LOCAL_READY_MB * 1024 * 1024
 
 # Redis key templates
@@ -332,6 +333,8 @@ class DownloadTask:
                         metrics.total_downloaded_mb += len(data) / 1024 / 1024
                     except Exception:
                         pass
+
+                    await asyncio.sleep(DL_THROTTLE_S)
 
                 except asyncio.CancelledError:
                     print(f"[dl:{self.movie_id}] cancelled at {current_offset/1024/1024:.1f}MB")
