@@ -29,7 +29,7 @@ from clients import pool as client_pool
 
 # ── Constants ───────────────────────────────────────────────────────────[...]
 # Import chunk sizes from streamer module to ensure consistency
-from streamer import TG_CHUNK, PREFETCH_CHUNK
+from streamer import TG_CHUNK, PREFETCH_CHUNK, TG_MAX_LIMIT
 
 LOCAL_READY_MB = int(os.getenv("LOCAL_READY_MB", "15"))  # Switch to local when 15MB ahead cached (empirically tuned for stability)
 STORAGE_DIR    = Path(os.getenv("STORAGE_DIR", "/tmp/tgstream"))
@@ -336,17 +336,26 @@ class DownloadTask:
                     msg  = await self._fresh_msg(c)
                     data = bytearray()
                     async with self._semaphore:
-                        async for piece in self.streamer.yield_file(
-                            msg,
-                            offset=current_offset,
-                            first_cut=0,
-                            last_cut=chunk_len,
-                            parts=1,
-                            chunk=PREFETCH_CHUNK,
-                            c=c,
-                            c_idx=c_idx,
-                        ):
-                            data.extend(piece)
+                        # PREFETCH_CHUNK is the logical batch size, but Telegram's
+                        # GetFile limit is capped at TG_MAX_LIMIT (1MB). We therefore
+                        # loop internally to fetch the full 2MB batch in two 1MB requests.
+                        bytes_remaining = chunk_len
+                        current_pos = current_offset
+                        while bytes_remaining > 0:
+                            request_chunk = min(TG_MAX_LIMIT, bytes_remaining)
+                            async for piece in self.streamer.yield_file(
+                                msg,
+                                offset=current_pos,
+                                first_cut=0,
+                                last_cut=request_chunk,
+                                parts=1,
+                                chunk=TG_MAX_LIMIT,
+                                c=c,
+                                c_idx=c_idx,
+                            ):
+                                data.extend(piece)
+                            bytes_remaining -= request_chunk
+                            current_pos += request_chunk
 
                     if not data:
                         raise Exception("No data from Telegram")
