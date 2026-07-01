@@ -31,6 +31,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pyrogram import Client
 from pyrogram.errors import FloodWait
+from starlette.status import HTTP_401_UNAUTHORIZED
 
 import pyrogram.utils
 import state as st
@@ -75,7 +76,8 @@ WAIT_TIMEOUT_S     = float(os.getenv("WAIT_TIMEOUT_S", "1.0"))  # Reduced from 2
 STARTUP_CHUNKS     = int(os.getenv("STARTUP_CHUNKS", "2"))  # 2 chunks × 1MB = 2MB initial fetch
 LOCAL_READ_CHUNK   = int(os.getenv("LOCAL_READ_CHUNK", str(1024 * 1024)))  # Match TG_CHUNK for consistency
 SHORT_WAIT_GRACE_BYTES = int(os.getenv("SHORT_WAIT_GRACE_BYTES", str(2 * 1024 * 1024)))  # 2MB grace window for Path B
-# LOCAL_READY_BYTES imported from downloader (default 50MB)
+DEBUG_PASSWORD     = os.getenv("DEBUG_PASSWORD", "")  # Password for /debug/* endpoints (if set)
+# LOCAL_READY_BYTES imported from downloader (default 15MB)
 
 tg: Client = None
 redis_client: aioredis.Redis = None
@@ -222,8 +224,21 @@ async def manifest(): return JSONResponse(MANIFEST)
 async def manual_sync(): return {"synced": await _sync_channel(force=True)}
 
 
+async def _debug_auth(request: Request):
+    """Check debug endpoint authentication if DEBUG_PASSWORD is set."""
+    if not DEBUG_PASSWORD:
+        return  # No password set, allow access
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        if token == DEBUG_PASSWORD:
+            return
+    raise HTTPException(status_code=HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+
 @app.get("/debug/movies")
-async def debug_movies():
+async def debug_movies(request: Request):
+    await _debug_auth(request)
     movies = await st.load_movies(redis_client)
     for mid, m in movies.items():
         task = download_manager.get(mid)
@@ -252,7 +267,8 @@ async def debug_movies():
 
 
 @app.get("/debug/downloads")
-async def debug_downloads():
+async def debug_downloads(request: Request):
+    await _debug_auth(request)
     stats  = download_manager.stats()
     movies = await st.load_movies(redis_client)
     for mid, s in stats.items():
