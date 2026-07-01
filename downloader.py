@@ -277,14 +277,15 @@ class DownloadTask:
           - Never waits for 90% triggers or batch boundaries.
           - Proxy switches to local once LOCAL_READY_BYTES ahead of hint is cached.
         """
-        if hasattr(self.streamer.client, "acquire_download_slot"):
-            c_idx, c = await self.streamer.client.acquire_download_slot()
-        elif hasattr(self.streamer.client, "pick"):
-            c_idx, c = await self.streamer.client.pick()
-        else:
-            c_idx, c = None, self.streamer.client
+        # No longer pin one client for the whole task lifetime — client
+        # selection now happens per chunk below, alternating across the
+        # pool so a single background download uses both sessions' worth
+        # of throughput instead of one client doing all the work.
+        pool_size = len(self.streamer.client) if hasattr(self.streamer.client, "__len__") else 1
+        c_idx, c = (None, None) if hasattr(self.streamer.client, "pick") else (None, self.streamer.client)
 
-        print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB using client {c_idx if c_idx is not None else 0}")
+        print(f"[dl:{self.movie_id}] start size={self.file_size/1024/1024:.1f}MB "
+              f"{'alternating across ' + str(pool_size) + ' client(s)' if hasattr(self.streamer.client, 'pick') else 'using single client'}")
         try:
             from metrics import metrics
             metrics.downloads_active += 1
@@ -321,6 +322,13 @@ class DownloadTask:
                     await asyncio.sleep(0.5)
                     if self._seek_event.is_set():
                         break  # re-check seek/offset before resuming below
+
+                # Alternate clients per chunk — each chunk independently
+                # picks whichever session is least recently used pool-wide,
+                # so this task naturally interleaves with both its own
+                # other chunks and any concurrent downloads/live streams.
+                if hasattr(self.streamer.client, "pick"):
+                    c_idx, c = await self.streamer.client.pick()
 
                 try:
                     msg  = await self._fresh_msg(c)
@@ -384,8 +392,6 @@ class DownloadTask:
                 metrics.downloads_active = max(0, metrics.downloads_active - 1)
             except Exception:
                 pass
-            if c_idx is not None and hasattr(self.streamer.client, "release_download_slot"):
-                self.streamer.client.release_download_slot(c_idx)
 
 
     def _find_next_gap(self, from_offset: int) -> int:
