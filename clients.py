@@ -26,6 +26,7 @@ class ClientPool:
         self.clients: List[Client] = []
         self._rr_counter = 0
         self._cooldown_until: Dict[int, float] = {}
+        self._download_load: Dict[int, int] = {}   # idx -> # active DownloadTasks pinned to it
         self._lock = asyncio.Lock()
 
     @staticmethod
@@ -120,6 +121,27 @@ class ClientPool:
         """Client used for cheap metadata calls (get_messages etc) that
         rarely trip FloodWait — no need to rotate these."""
         return self.clients[0]
+
+    async def acquire_download_slot(self) -> Tuple[int, Client]:
+        """Pick the client with the fewest active background DownloadTasks
+        pinned to it (not cooling down), instead of blind round-robin.
+
+        Plain pick() alternates purely by call count, so multiple long-lived
+        DownloadTasks started close together can all land on the same client
+        while others sit idle — the exact opposite of what the pool is for.
+        Caller must call release_download_slot(idx) when the task ends.
+        """
+        async with self._lock:
+            avail = self._available()
+            if not avail:
+                avail = list(range(len(self.clients)))
+            chosen = min(avail, key=lambda i: self._download_load.get(i, 0))
+            self._download_load[chosen] = self._download_load.get(chosen, 0) + 1
+            return chosen, self.clients[chosen]
+
+    def release_download_slot(self, idx: int) -> None:
+        if idx in self._download_load:
+            self._download_load[idx] = max(0, self._download_load[idx] - 1)
 
     def __len__(self):
         return len(self.clients)

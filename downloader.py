@@ -277,7 +277,9 @@ class DownloadTask:
           - Never waits for 90% triggers or batch boundaries.
           - Proxy switches to local once LOCAL_READY_BYTES ahead of hint is cached.
         """
-        if hasattr(self.streamer.client, "pick"):
+        if hasattr(self.streamer.client, "acquire_download_slot"):
+            c_idx, c = await self.streamer.client.acquire_download_slot()
+        elif hasattr(self.streamer.client, "pick"):
             c_idx, c = await self.streamer.client.pick()
         else:
             c_idx, c = None, self.streamer.client
@@ -382,6 +384,8 @@ class DownloadTask:
                 metrics.downloads_active = max(0, metrics.downloads_active - 1)
             except Exception:
                 pass
+            if c_idx is not None and hasattr(self.streamer.client, "release_download_slot"):
+                self.streamer.client.release_download_slot(c_idx)
 
 
     def _find_next_gap(self, from_offset: int) -> int:
