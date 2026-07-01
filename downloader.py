@@ -28,13 +28,15 @@ import redis.asyncio as aioredis
 from clients import pool as client_pool
 
 # ── Constants ───────────────────────────────────────────────────────────[...]
-TG_CHUNK       = 1024 * 1024          # 1 MB per MTProto GetFile call (matches streamer.py)
+# Import chunk sizes from streamer module to ensure consistency
+from streamer import TG_CHUNK, PREFETCH_CHUNK
+
 LOCAL_READY_MB = int(os.getenv("LOCAL_READY_MB", "15"))  # Switch to local when 15MB ahead cached (empirically tuned for stability)
 STORAGE_DIR    = Path(os.getenv("STORAGE_DIR", "/tmp/tgstream"))
 MAX_LOCAL_GB   = float(os.getenv("MAX_LOCAL_GB", "10"))  # evict LRU beyond this
 DL_MIN_BACKOFF = float(os.getenv("DL_MIN_BACKOFF", "2"))  # Backoff on error (seconds)
 SEEK_GRACE_DELAY_S = float(os.getenv("SEEK_GRACE_DELAY_S", "5"))  # Pause downloader after seek, let live proxy claim MTProto first
-DL_THROTTLE_S  = float(os.getenv("DL_THROTTLE_S", "1.5"))  # Sleep between successful chunks
+DL_THROTTLE_S  = float(os.getenv("DL_THROTTLE_S", "0.15"))  # Sleep between successful chunks (reduced for larger prefetch chunks)
 LOCAL_READY_BYTES = LOCAL_READY_MB * 1024 * 1024
 
 # Redis key templates
@@ -293,13 +295,13 @@ class DownloadTask:
             pass
 
         try:
-            current_offset = (self._hint // TG_CHUNK) * TG_CHUNK
+            current_offset = (self._hint // PREFETCH_CHUNK) * PREFETCH_CHUNK
 
             while current_offset < self.file_size:
                 # Re-anchor if seek jumped ahead
                 if self._seek_event.is_set():
                     self._seek_event.clear()
-                    current_offset = (self._hint // TG_CHUNK) * TG_CHUNK
+                    current_offset = (self._hint // PREFETCH_CHUNK) * PREFETCH_CHUNK
                     print(f"[dl:{self.movie_id}] seek → re-anchor at {current_offset/1024/1024:.1f}MB")
                     # Grace delay: let the live proxy stream claim the MTProto session
                     # first after a seek, instead of both proxy and downloader hitting
@@ -307,7 +309,7 @@ class DownloadTask:
                     await asyncio.sleep(SEEK_GRACE_DELAY_S)
 
                 # Skip already-cached chunk
-                chunk_end = min(current_offset + TG_CHUNK - 1, self.file_size - 1)
+                chunk_end = min(current_offset + PREFETCH_CHUNK - 1, self.file_size - 1)
                 if self.dl_map.has_range(current_offset, chunk_end):
                     current_offset = chunk_end + 1
                     continue
@@ -340,7 +342,7 @@ class DownloadTask:
                             first_cut=0,
                             last_cut=chunk_len,
                             parts=1,
-                            chunk=TG_CHUNK,
+                            chunk=PREFETCH_CHUNK,
                             c=c,
                             c_idx=c_idx,
                         ):
@@ -398,8 +400,8 @@ class DownloadTask:
         """Find first byte >= from_offset not in dl_map."""
         ivs = self.dl_map._ivs
         if not ivs:
-            return (from_offset // TG_CHUNK) * TG_CHUNK
-        candidate = (from_offset // TG_CHUNK) * TG_CHUNK
+            return (from_offset // PREFETCH_CHUNK) * PREFETCH_CHUNK
+        candidate = (from_offset // PREFETCH_CHUNK) * PREFETCH_CHUNK
         for s, e in ivs:
             if candidate < s:
                 return candidate
