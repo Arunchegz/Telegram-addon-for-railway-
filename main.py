@@ -134,16 +134,24 @@ async def _fetch_msg(msg_id: int, client: Client = None):
 async def _sync_loop():
     while True:
         try:
-            last = await redis_client.get(st.R_SYNC_TS)
-            if not last or (time.time() - float(last)) > SYNC_INTERVAL:
-                await _sync_channel()
+            await _sync_channel(force=False)
         except Exception as e:
             print(f"[sync_loop] {e}")
         await asyncio.sleep(60)
 
 
-async def _sync_channel() -> int:
+async def _sync_channel(force: bool = False) -> int:
     async with _sync_lock:
+        if not force:
+            last = await redis_client.get(st.R_SYNC_TS)
+            if last:
+                try:
+                    if (time.time() - float(last)) < SYNC_INTERVAL:
+                        # Return the current movies count
+                        return await redis_client.hlen(st.R_MOVIES)
+                except ValueError:
+                    pass
+
         acquired = await redis_client.set(st.R_SYNC_LCK, "1", ex=600, nx=True)
         if not acquired:
             return 0
@@ -211,7 +219,7 @@ async def manifest(): return JSONResponse(MANIFEST)
 
 
 @app.get("/sync")
-async def manual_sync(): return {"synced": await _sync_channel()}
+async def manual_sync(): return {"synced": await _sync_channel(force=True)}
 
 
 @app.get("/debug/movies")
@@ -258,10 +266,10 @@ async def debug_downloads():
 
 @app.get("/catalog/{type}/{id}.json")
 async def catalog(type: str, id: str):
-    # Always trigger sync on catalog request for freshest data
+    # Always trigger sync on catalog request for freshest data (using rate-limiting inside _sync_channel)
     print(f"Catalog request: triggering fresh sync")
     try:
-        await _sync_channel()
+        await _sync_channel(force=False)
     except Exception as e:
         print(f"Catalog sync failed: {e}")
     
