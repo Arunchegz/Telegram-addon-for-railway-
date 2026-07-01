@@ -134,12 +134,9 @@ async def _fetch_msg(msg_id: int, client: Client = None):
 
 
 async def _sync_loop():
+    # Sync only on catalog requests (no background periodic sync)
     while True:
-        try:
-            await _sync_channel(force=False)
-        except Exception as e:
-            print(f"[sync_loop] {e}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(3600)  # Sleep indefinitely, only sync when /catalog is called
 
 
 async def _sync_channel(force: bool = False) -> int:
