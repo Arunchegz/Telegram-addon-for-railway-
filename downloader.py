@@ -311,6 +311,15 @@ class DownloadTask:
 
                 chunk_len = chunk_end - current_offset + 1
 
+                # Give priority to live playback: pause background fetch
+                # entirely while any foreground stream is actively pulling
+                # bytes, so both sessions stay free for whoever is watching
+                # right now instead of splitting throughput with prefetch.
+                while getattr(self.streamer, "live_streams", 0) > 0:
+                    await asyncio.sleep(0.5)
+                    if self._seek_event.is_set():
+                        break  # re-check seek/offset before resuming below
+
                 try:
                     msg  = await self._fresh_msg(c)
                     data = bytearray()

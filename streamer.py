@@ -39,6 +39,18 @@ class ByteStreamer:
         concurrency = max(MAX_CONCURRENT_GETFILE, pool_size)
         self._concurrent_semaphore = asyncio.Semaphore(concurrency)  # Global concurrency limit
 
+        # Live-playback priority: counts requests currently pulling bytes
+        # for active/foreground streaming (Path C tail + Path D). Background
+        # downloader checks this and pauses while it's > 0, so both sessions
+        # stay free for whoever is actually watching right now.
+        self.live_streams = 0
+
+    def mark_live_start(self) -> None:
+        self.live_streams += 1
+
+    def mark_live_end(self) -> None:
+        self.live_streams = max(0, self.live_streams - 1)
+
     async def _throttle(self, c_idx=None) -> None:
         """Enforce minimum inter-request delay to avoid Telegram rate limits.
 
