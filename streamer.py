@@ -28,8 +28,8 @@ MAX_CONCURRENT_GETFILE = 1  # Single concurrent GetFile to prevent request storm
 class ByteStreamer:
     def __init__(self, client: Client):
         self.client = client
-        self._last_invoke_time = 0.0
-        self._throttle_lock = asyncio.Lock()  # Serialize throttle across concurrent streams
+        self._last_invoke_time: dict = {}      # key: c_idx (None for single-client mode)
+        self._throttle_locks: dict = {}        # per-client lock, created lazily
         self._session_lock = asyncio.Lock()   # Lock to serialize session creation
         self._backoff_until = {}  # Per-DC backoff state: {dc_id: until_timestamp}
         # If `client` is actually a ClientPool (has __len__), scale concurrent
@@ -39,17 +39,21 @@ class ByteStreamer:
         concurrency = max(MAX_CONCURRENT_GETFILE, pool_size)
         self._concurrent_semaphore = asyncio.Semaphore(concurrency)  # Global concurrency limit
 
-    async def _throttle(self) -> None:
+    async def _throttle(self, c_idx=None) -> None:
         """Enforce minimum inter-request delay to avoid Telegram rate limits.
 
-        Lock ensures concurrent streams don't both read the same _last_invoke_time
-        and fire simultaneous GetFile calls — which caused the FloodWait cascade.
+        Keyed per client (c_idx) — each session gets its own 500ms budget
+        instead of all sessions sharing one global timer. A pool of N
+        clients can therefore sustain ~N req/s combined instead of being
+        capped at ~1 req/s system-wide regardless of pool size.
         """
-        async with self._throttle_lock:
-            elapsed = (time.time() - self._last_invoke_time) * 1000
+        lock = self._throttle_locks.setdefault(c_idx, asyncio.Lock())
+        async with lock:
+            last = self._last_invoke_time.get(c_idx, 0.0)
+            elapsed = (time.time() - last) * 1000
             if elapsed < MIN_THROTTLE_MS:
                 await asyncio.sleep((MIN_THROTTLE_MS - elapsed) / 1000)
-            self._last_invoke_time = time.time()
+            self._last_invoke_time[c_idx] = time.time()
 
     async def _wait_backoff(self, dc_id: int, flood_wait_s: int) -> None:
         """Exponential backoff with jitter on FloodWait."""
@@ -101,7 +105,7 @@ class ByteStreamer:
 
         try:
             async with self._concurrent_semaphore:
-                await self._throttle()  # Apply inter-request throttle
+                await self._throttle(c_idx)  # Apply inter-request throttle
                 try:
                     r = await session.invoke(
                         raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
@@ -146,7 +150,7 @@ class ByteStreamer:
             if part > parts:
                 break
 
-            await self._throttle()  # Throttle between chunks
+            await self._throttle(c_idx)  # Throttle between chunks
             try:
                 async with self._concurrent_semaphore:
                     r = await session.invoke(
