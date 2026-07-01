@@ -109,8 +109,11 @@ class ClientPool:
                 print(f"[clients] all {len(self.clients)} client(s) cooling down, waiting {wait:.1f}s")
                 await asyncio.sleep(wait)
                 avail = self._available() or list(range(len(self.clients)))
-            self._rr_counter = (self._rr_counter + 1) % len(avail)
-            chosen = avail[self._rr_counter]
+            # Rotate over the full client count, not len(avail) — avail shrinks
+            # whenever a client is cooling down, which skewed the round-robin
+            # toward whichever clients happened to be available at pick time.
+            self._rr_counter = (self._rr_counter + 1) % len(self.clients)
+            chosen = avail[self._rr_counter % len(avail)]
             return chosen, self.clients[chosen]
 
     def primary(self) -> Client:

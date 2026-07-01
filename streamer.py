@@ -32,7 +32,12 @@ class ByteStreamer:
         self._throttle_lock = asyncio.Lock()  # Serialize throttle across concurrent streams
         self._session_lock = asyncio.Lock()   # Lock to serialize session creation
         self._backoff_until = {}  # Per-DC backoff state: {dc_id: until_timestamp}
-        self._concurrent_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GETFILE)  # Global concurrency limit
+        # If `client` is actually a ClientPool (has __len__), scale concurrent
+        # GetFile slots to the pool size — one slot per session — instead of
+        # serializing every stream in the process through a single global lock.
+        pool_size = len(client) if hasattr(client, "__len__") else 1
+        concurrency = max(MAX_CONCURRENT_GETFILE, pool_size)
+        self._concurrent_semaphore = asyncio.Semaphore(concurrency)  # Global concurrency limit
 
     async def _throttle(self) -> None:
         """Enforce minimum inter-request delay to avoid Telegram rate limits.
