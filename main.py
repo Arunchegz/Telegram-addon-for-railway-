@@ -105,7 +105,15 @@ def _log_task_exception(task: asyncio.Task):
 async def lifespan(app: FastAPI):
     global tg, redis_client, byte_streamer, stream_sem
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-    redis_client = aioredis.from_url(REDIS_URL, decode_responses=False)
+    # Configure Redis with retry and connection pool settings for resilience
+    redis_client = aioredis.from_url(
+        REDIS_URL,
+        decode_responses=False,
+        socket_connect_timeout=10,
+        socket_keepalive=True,
+        retry_on_timeout=True,
+        health_check_interval=30,
+    )
     stream_sem   = asyncio.Semaphore(STREAM_CONCURRENCY)
 
     await client_pool.start(API_ID, API_HASH, CHANNEL_USERNAME)
@@ -293,11 +301,26 @@ async def catalog(type: str, id: str):
         filtered = {mid: m for mid, m in movies.items() if not is_series(m)}
         async def build(mid, m):
             fn = m.get("file_name","Unknown")
-            poster = await st.get_poster(redis_client, fn)
+            try:
+                poster = await st.get_poster(redis_client, fn)
+            except Exception as e:
+                print(f"[catalog] Poster fetch failed for {fn}: {e}")
+                poster = "https://via.placeholder.com/300x450?text=No+Poster"
             title, year = st.parse_title_year(fn)
             return {"id": f"tgm:{mid}", "type": "movie", "name": title or fn,
                     "poster": poster, "posterShape": "poster", "year": year}
-        metas = await asyncio.gather(*[build(mid, m) for mid, m in filtered.items()])
+        # Process movies in batches to avoid overwhelming Redis
+        metas = []
+        batch_size = 5
+        items = list(filtered.items())
+        for i in range(0, len(items), batch_size):
+            batch = items[i:i+batch_size]
+            batch_metas = await asyncio.gather(*[build(mid, m) for mid, m in batch], return_exceptions=True)
+            for result in batch_metas:
+                if isinstance(result, Exception):
+                    print(f"[catalog] Build failed: {result}")
+                else:
+                    metas.append(result)
         return JSONResponse({"metas": list(metas)}, headers={"Cache-Control": "no-store"})
     
     else:  # type == "series"
@@ -313,7 +336,11 @@ async def catalog(type: str, id: str):
             
         async def build_series(sid, group):
             fn = group["files"][0][1].get("file_name","Unknown")
-            poster = await st.get_poster(redis_client, fn)
+            try:
+                poster = await st.get_poster(redis_client, fn)
+            except Exception as e:
+                print(f"[catalog] Poster fetch failed for {fn}: {e}")
+                poster = "https://via.placeholder.com/300x450?text=No+Poster"
             year = ""
             for _, m in group["files"]:
                 _, y = st.parse_title_year(m.get("file_name",""))
@@ -322,7 +349,18 @@ async def catalog(type: str, id: str):
                     break
             return {"id": f"tgs:{sid}", "type": "series", "name": group["title"],
                     "poster": poster, "posterShape": "poster", "year": year}
-        metas = await asyncio.gather(*[build_series(sid, group) for sid, group in series_groups.items()])
+        # Process series in batches to avoid overwhelming Redis
+        metas = []
+        batch_size = 5
+        items = list(series_groups.items())
+        for i in range(0, len(items), batch_size):
+            batch = items[i:i+batch_size]
+            batch_metas = await asyncio.gather(*[build_series(sid, group) for sid, group in batch], return_exceptions=True)
+            for result in batch_metas:
+                if isinstance(result, Exception):
+                    print(f"[catalog] Build failed: {result}")
+                else:
+                    metas.append(result)
         return JSONResponse({"metas": list(metas)}, headers={"Cache-Control": "no-store"})
 
 
@@ -341,8 +379,13 @@ async def meta(type: str, id: str):
         if not movie: return JSONResponse({"meta": {}})
         fn = movie.get("file_name","Unknown")
         title, year = st.parse_title_year(fn)
+        try:
+            poster = await st.get_poster(redis_client, fn)
+        except Exception as e:
+            print(f"[meta] Poster fetch failed for {fn}: {e}")
+            poster = "https://via.placeholder.com/300x450?text=No+Poster"
         return JSONResponse({"meta": {"id": id, "type": type, "name": title or fn, "year": year,
-            "poster": await st.get_poster(redis_client, fn), "description": fn, "posterShape": "poster"}})
+            "poster": poster, "description": fn, "posterShape": "poster"}})
     else:  # type == "series"
         matching_files = [m for m in movies.values() if st.show_id(m.get("file_name", "")) == clean]
         if not matching_files: return JSONResponse({"meta": {}})
@@ -351,7 +394,11 @@ async def meta(type: str, id: str):
         first_file = matching_files[0]
         fn = first_file.get("file_name", "Unknown")
         show_title = st.parse_show_title(fn)
-        poster = await st.get_poster(redis_client, fn)
+        try:
+            poster = await st.get_poster(redis_client, fn)
+        except Exception as e:
+            print(f"[meta] Poster fetch failed for {fn}: {e}")
+            poster = "https://via.placeholder.com/300x450?text=No+Poster"
         year = ""
         for m in matching_files:
             _, y = st.parse_title_year(m.get("file_name", ""))
