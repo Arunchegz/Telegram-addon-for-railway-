@@ -35,11 +35,17 @@ async def del_movie(redis: aioredis.Redis, mid: str):
 # ── Poster cache ──────────────────────────────────────────────────────────────
 async def get_poster(redis: aioredis.Redis, filename: str) -> str:
     key = R_POSTER.format(filename[:80])
-    cached = await redis.get(key)
-    if cached:
-        return cached.decode()
+    try:
+        cached = await redis.get(key)
+        if cached:
+            return cached.decode()
+    except Exception as e:
+        print(f"[poster] Redis get failed for {filename}: {e}")
     url = await _fetch_poster(filename)
-    await redis.setex(key, 86400, url)
+    try:
+        await redis.setex(key, 86400, url)
+    except Exception as e:
+        print(f"[poster] Redis set failed for {filename}: {e}")
     return url
 
 
