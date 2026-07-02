@@ -15,7 +15,7 @@ import time
 from typing import AsyncGenerator
 
 from pyrogram import Client, raw, utils
-from pyrogram.errors import AuthBytesInvalid, FileReferenceExpired, FloodWait
+from pyrogram.errors import AuthBytesInvalid, FileReferenceExpired, FloodWait, RpcConnectFailed, Timeout
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
 from pyrogram.session import Auth, Session
 
@@ -124,10 +124,11 @@ class ByteStreamer:
                     r = await session.invoke(
                         raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
                     )
-                except FloodWait as e:
+                except (FloodWait, Timeout, RpcConnectFailed) as e:
+                    wait_s = e.value if hasattr(e, 'value') else 5
                     if c_idx is not None and hasattr(self.client, "mark_cooldown"):
-                        self.client.mark_cooldown(c_idx, e.value)
-                    await self._wait_backoff(dc_id, e.value)
+                        self.client.mark_cooldown(c_idx, wait_s)
+                    await self._wait_backoff(dc_id, wait_s)
                     # Retry after backoff
                     if _retry:
                         async for b in self.yield_file(msg, offset, first_cut, last_cut, parts, chunk, False, c, c_idx):
@@ -170,10 +171,11 @@ class ByteStreamer:
                     r = await session.invoke(
                         raw.functions.upload.GetFile(location=loc, offset=off, limit=chunk)
                     )
-            except FloodWait as e:
+            except (FloodWait, Timeout, RpcConnectFailed) as e:
+                wait_s = e.value if hasattr(e, 'value') else 5
                 if c_idx is not None and hasattr(self.client, "mark_cooldown"):
-                    self.client.mark_cooldown(c_idx, e.value)
-                await self._wait_backoff(dc_id, e.value)
+                    self.client.mark_cooldown(c_idx, wait_s)
+                await self._wait_backoff(dc_id, wait_s)
                 # Retry after backoff
                 if _retry:
                     async for b in self.yield_file(msg, off, 0, last_cut, parts - part + 1, chunk, False, c, c_idx):
